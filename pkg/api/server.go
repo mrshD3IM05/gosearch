@@ -13,6 +13,15 @@
 //	GET    /api/search?index=NAME&q=QUERY&limit=N
 //	       AND-search over the inverted index, hits sorted by TF-IDF score
 //
+// Database table search (only when a database is linked via WithDB:
+// cmd/gosearch -db sn.db):
+//
+//	GET    /api/db/tables
+//	       list table/view names for building table pickers
+//	GET    /api/db/search?table=T&q=QUERY&search=C1,C2&return=R1,R2&limit=N
+//	       search rows of a table live. `search` picks the matching columns,
+//	       `return` the columns in the result (empty = all). Both are CSV.
+//
 // Tooling endpoint:
 //
 //	POST   /samples?index=NAME   bulk-load the embedded course-title corpus
@@ -32,7 +41,9 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 
+	"gosearch/pkg/gosearcher"
 	"gosearch/pkg/samples"
 	"gosearch/pkg/search"
 	"gosearch/pkg/storage"
@@ -50,10 +61,12 @@ const (
 )
 
 // Server wires HTTP handlers to the document store and the inverted index.
-// The two are kept in sync here: every successful write updates both.
+// The two are kept in sync here: every successful write updates both. An
+// optional GoSearcher (WithDB) adds the /api/db/* table-search endpoints.
 type Server struct {
 	store   *storage.Store
 	idx     *search.Index
+	db      *gosearcher.GoSearcher
 	mux     *http.ServeMux
 	handler http.Handler
 }
@@ -62,7 +75,24 @@ type Server struct {
 // handler is wrapped in a CORS layer so the standalone web console (served on
 // a different origin by cmd/webtest) can call it cross-origin.
 func NewServer(store *storage.Store, idx *search.Index) *Server {
-	s := &Server{store: store, idx: idx, mux: http.NewServeMux()}
+	s := &Server{store: store, idx: idx}
+	s.register()
+	return s
+}
+
+// WithDB attaches a database-backed GoSearcher so the /api/db/* endpoints come
+// up. Call it before serving: it rebuilds the routing tree. Returns the
+// receiver for chaining.
+func (s *Server) WithDB(db *gosearcher.GoSearcher) *Server {
+	s.db = db
+	s.register()
+	return s
+}
+
+// register builds the routing tree. It is called by NewServer and again by
+// WithDB once a database is attached.
+func (s *Server) register() {
+	s.mux = http.NewServeMux()
 
 	s.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -75,8 +105,12 @@ func NewServer(store *storage.Store, idx *search.Index) *Server {
 	s.mux.HandleFunc("GET /api/search", s.handleSearch)
 	s.mux.HandleFunc("POST /samples", s.handleLoadSamples)
 
+	if s.db != nil {
+		s.mux.HandleFunc("GET /api/db/tables", s.handleDBTables)
+		s.mux.HandleFunc("GET /api/db/search", s.handleDBSearch)
+	}
+
 	s.handler = withCORS(s.mux)
-	return s
 }
 
 // indexDoc writes a document to both the store and the inverted index in one
@@ -298,6 +332,105 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		"total": total,
 		"hits":  out,
 	})
+}
+
+// handleDBTables lists the linked database's tables and views.
+//
+//	GET /api/db/tables  →  {"tables": ["comments", "posts", ...]}
+func (s *Server) handleDBTables(w http.ResponseWriter, r *http.Request) {
+	tables, err := s.db.ListTables(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "listing tables: "+err.Error())
+		return
+	}
+	if tables == nil {
+		tables = []string{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"tables": tables})
+}
+
+// handleDBSearch searches rows of one table, matching only the `search`
+// columns and returning only the `return` columns.
+//
+//	GET /api/db/search?table=posts&q=sunset&search=content&return=id,content&limit=5
+//
+// Parameters:
+//
+//	table   required
+//	q       required; analyzed like document search (exact > prefix > substring)
+//	search  required, CSV; which columns are examined for matches
+//	return  optional, CSV; which columns appear in results (empty = all)
+//	limit   optional positive integer, default 20, capped at 100
+func (s *Server) handleDBSearch(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	table, query := q.Get("table"), q.Get("q")
+	searchCols := splitCSV(q.Get("search"))
+	returnCols := splitCSV(q.Get("return"))
+
+	switch {
+	case table == "":
+		writeError(w, http.StatusBadRequest, "missing required parameter: table")
+		return
+	case query == "":
+		writeError(w, http.StatusBadRequest, "missing required parameter: q")
+		return
+	case len(searchCols) == 0:
+		writeError(w, http.StatusBadRequest, "missing required parameter: search (comma-separated columns)")
+		return
+	}
+
+	limit := defaultSearchLimit
+	if raw := q.Get("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 {
+			writeError(w, http.StatusBadRequest, "limit must be a positive integer")
+			return
+		}
+		limit = n
+	}
+	if limit > maxSearchLimit {
+		limit = maxSearchLimit
+	}
+
+	rows, total, err := s.db.SearchTable(r.Context(), gosearcher.TableSearch{
+		Table:      table,
+		Query:      query,
+		SearchCols: searchCols,
+		ReturnCols: returnCols,
+		Limit:      limit,
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "database search failed: "+err.Error())
+		return
+	}
+	if rows == nil {
+		rows = []map[string]any{}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"table": table,
+		"query": query,
+		"total": total,
+		"hits":  rows,
+	})
+}
+
+// splitCSV splits a query-string column list, trimming and dropping empties in
+// both directions ("a, b,," → ["a", "b"]). The empty string yields nil.
+func splitCSV(s string) []string {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // writeError writes a JSON error body in an Elasticsearch-like shape:

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"gosearch/pkg/gosearcher"
 	"gosearch/pkg/search"
 	"gosearch/pkg/storage"
 )
@@ -297,6 +299,147 @@ func TestPutRejectsOversizedBody(t *testing.T) {
 	res, _ := doJSON(t, h, http.MethodPut, "/index/products/1", body)
 	if res.StatusCode != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400 for oversized body", res.StatusCode)
+	}
+}
+
+// ---- database table-search endpoints (in-memory fake, no SQL driver) --------
+
+// apiFakeRows implements gosearcher.Rows over a fixed result set.
+type apiFakeRows struct {
+	cols []string
+	rows [][]any
+	pos  int
+}
+
+func (f *apiFakeRows) Columns() ([]string, error) { return f.cols, nil }
+func (f *apiFakeRows) Next() bool                 { f.pos++; return f.pos <= len(f.rows) }
+func (f *apiFakeRows) Scan(dest ...any) error {
+	row := f.rows[f.pos-1]
+	for i := range dest {
+		switch d := dest[i].(type) {
+		case *any:
+			*d = row[i]
+		case *string:
+			*d = row[i].(string)
+		default:
+			return fmt.Errorf("apiFakeRows: unsupported dest type %T", dest[i])
+		}
+	}
+	return nil
+}
+func (f *apiFakeRows) Err() error   { return nil }
+func (f *apiFakeRows) Close() error { return nil }
+
+// apiFakeDB routes by query: sqlite_master queries list tables, anything else
+// returns post rows.
+type apiFakeDB struct{}
+
+func (apiFakeDB) QueryContext(_ context.Context, query string, _ ...any) (gosearcher.Rows, error) {
+	if strings.Contains(query, "sqlite_master") {
+		return &apiFakeRows{cols: []string{"name"}, rows: [][]any{{"comments"}, {"posts"}}}, nil
+	}
+	return &apiFakeRows{
+		cols: []string{"id", "content", "likes"},
+		rows: [][]any{
+			{1, "Watching the sunset from the rooftop", 3},
+			{2, "today is sunny", 5},
+			{3, "the rooftop concert was great", 2},
+		},
+	}, nil
+}
+
+// newTestServerWithDB returns a handler whose /api/db/* endpoints point at the
+// fake database.
+func newTestServerWithDB(t *testing.T) http.Handler {
+	t.Helper()
+	return NewServer(storage.NewStore(), search.NewIndex()).
+		WithDB(gosearcher.NewGoSearcher().LinkQuerier(apiFakeDB{})).
+		Handler()
+}
+
+// TestDBTablesEndpoint: /api/db/tables lists names for the UI picker.
+func TestDBTablesEndpoint(t *testing.T) {
+	h := newTestServerWithDB(t)
+
+	res, body := doJSON(t, h, http.MethodGet, "/api/db/tables", "")
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %v", res.StatusCode, body)
+	}
+	tables, ok := body["tables"].([]any)
+	if !ok || len(tables) != 2 || tables[0] != "comments" || tables[1] != "posts" {
+		t.Errorf("tables = %v, want [comments posts]", body["tables"])
+	}
+}
+
+// TestDBSearchEndpoint: searches only the chosen column, returns only the
+// chosen columns, and reports the true total.
+func TestDBSearchEndpoint(t *testing.T) {
+	h := newTestServerWithDB(t)
+
+	res, body := doJSON(t, h, http.MethodGet,
+		"/api/db/search?table=posts&q=rooftop&search=content&return=id,content&limit=5", "")
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %v", res.StatusCode, body)
+	}
+	if body["table"] != "posts" || body["total"] != float64(2) {
+		t.Errorf("table=%v total=%v, want posts / 2", body["table"], body["total"])
+	}
+	hits, ok := body["hits"].([]any)
+	if !ok || len(hits) != 2 {
+		t.Fatalf("hits = %v, want 2", body["hits"])
+	}
+	for _, raw := range hits {
+		row := raw.(map[string]any)
+		if len(row) != 2 {
+			t.Errorf("row = %v, want exactly [id content]", row)
+		}
+	}
+	first := hits[0].(map[string]any)
+	if _, leaked := first["likes"]; leaked {
+		t.Error("unrequested column 'likes' leaked into results")
+	}
+	if first["id"] != float64(1) {
+		t.Errorf("first id = %v, want 1 (rooftop in row 1 and 3 → tie → row order)", first["id"])
+	}
+}
+
+// TestDBSearchEndpointValidation: bad params are rejected before any query.
+func TestDBSearchEndpointValidation(t *testing.T) {
+	h := newTestServerWithDB(t)
+
+	cases := []struct {
+		name   string
+		params string
+	}{
+		{"missing table", "q=rooftop&search=content"},
+		{"missing q", "table=posts&search=content"},
+		{"missing search", "table=posts&q=rooftop"},
+		{"bad limit", "table=posts&q=rooftop&search=content&limit=abc"},
+		{"zero limit", "table=posts&q=rooftop&search=content&limit=0"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res, body := doJSON(t, h, http.MethodGet, "/api/db/search?"+tc.params, "")
+			if res.StatusCode != http.StatusBadRequest {
+				t.Errorf("status = %d, want 400 (body %v)", res.StatusCode, body)
+			}
+		})
+	}
+}
+
+// TestDBEndpointsAbsentWithoutLink: without WithDB the DB endpoints 404, so
+// the console can detect an unlinked backend.
+func TestDBEndpointsAbsentWithoutLink(t *testing.T) {
+	h, _ := newTestServer(t)
+
+	for _, path := range []string{
+		"/api/db/tables",
+		"/api/db/search?table=posts&q=x&search=content",
+	} {
+		res, _ := doJSON(t, h, http.MethodGet, path, "")
+		if res.StatusCode != http.StatusNotFound {
+			t.Errorf("%s status = %d, want 404", path, res.StatusCode)
+		}
 	}
 }
 

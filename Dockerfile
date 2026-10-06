@@ -1,9 +1,12 @@
 # Builds a static gosearch binary and runs it from a scratch container.
-# The server only does HTTP, so no CA bundle or glibc is needed.
-FROM golang:1.25 AS build
+# The server only does HTTP, so no CA bundle or glibc is needed. The SQLite
+# dependency (modernc.org/sqlite) is pure Go, so CGO_ENABLED=0 still works.
+FROM golang:1.26 AS build
 WORKDIR /src
 
-COPY go.mod ./
+COPY go.mod go.sum ./
+RUN go mod download
+
 COPY cmd/ ./cmd/
 COPY pkg/ ./pkg/
 

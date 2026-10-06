@@ -52,6 +52,19 @@
   .tools h2 { font-size: 16px; margin: 32px 0 8px; }
   .add-doc { display: flex; flex-direction: column; gap: 8px; max-width: 520px; }
   #doc-json { font-family: ui-monospace, Consolas, monospace; resize: vertical; }
+  .db-search { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+  .db-search input { flex: 1 1 160px; }
+  #db-query { min-width: 220px; }
+  #db-results { overflow-x: auto; }
+  #db-results table {
+    border-collapse: collapse; width: 100%; background: var(--panel);
+    border: 1px solid var(--border); border-radius: 8px; font-size: 13px;
+  }
+  #db-results th, #db-results td {
+    border-bottom: 1px solid var(--border); padding: 6px 10px; text-align: left;
+  }
+  #db-results th { color: var(--muted); font-weight: 600; white-space: nowrap; }
+  #db-results tr:last-child td { border-bottom: none; }
   #status {
     position: fixed; left: 50%; bottom: 16px; transform: translateX(-50%);
     padding: 8px 16px; border-radius: 6px; font-size: 13px; opacity: 0;
@@ -95,6 +108,27 @@
         <button id="load-courses">Load course titles</button>
       </div>
     </div>
+
+    <section class="tools" id="db-panel">
+      <h2>Database table search <span class="sub">live rows from the linked SQLite file</span></h2>
+      <p class="hint">Search a table by specified columns and return the specified columns.
+        Try <kbd>sunset</kbd> in posts, or <kbd>congr</kbd> in comments.</p>
+      <div class="db-search">
+        <label>table
+          <input id="db-table" list="db-tables" value="posts" spellcheck="false">
+        </label>
+        <datalist id="db-tables"></datalist>
+        <label>search columns
+          <input id="db-search-cols" value="content" spellcheck="false" placeholder="name,description">
+        </label>
+        <label>return columns
+          <input id="db-return-cols" value="id,content,created_at" spellcheck="false" placeholder="(all)">
+        </label>
+        <input id="db-query" type="search" value="sunset" placeholder="sunset" spellcheck="false">
+        <button id="db-search-btn">Search table</button>
+      </div>
+      <section id="db-results"></section>
+    </section>
   </section>
 </main>
 
@@ -330,6 +364,88 @@ async function loadCourses() {
   }
 }
 
+// ---- database table search --------------------------------------------------
+
+// The DB endpoints only exist when the backend was started with -db sn.db. On
+// a plain backend /api/db/tables 404s, and we hide the whole panel.
+async function loadDBTables() {
+  const body = await req("/api/db/tables");
+  const list = $("db-tables");
+  list.textContent = "";
+  for (const name of body.tables) {
+    const opt = node("option");
+    opt.value = name;
+    list.appendChild(opt);
+  }
+}
+
+async function runDBSearch() {
+  const q = $("db-query").value.trim();
+  if (!q) {
+    showStatus("enter a term to search the table", "err");
+    return;
+  }
+  const params = new URLSearchParams({
+    table: $("db-table").value.trim() || "posts",
+    q: q,
+    limit: "20",
+  });
+  const searchCols = $("db-search-cols").value.trim();
+  const returnCols = $("db-return-cols").value.trim();
+  if (searchCols) params.set("search", searchCols);
+  if (returnCols) params.set("return", returnCols);
+
+  try {
+    const body = await req("/api/db/search?" + params.toString());
+    renderDBResults(body);
+  } catch (e) {
+    showStatus("table search failed: " + e.message, "err");
+  }
+}
+
+function renderDBResults(body) {
+  const el = $("db-results");
+  el.textContent = "";
+
+  const total = node("p", "total",
+    body.total + " match" + (body.total === 1 ? "" : "es") +
+    " in \u201C" + body.table + "\u201D for \u201C" + body.query + "\u201D");
+  el.appendChild(total);
+
+  if (body.hits.length === 0) {
+    el.appendChild(node("p", "hint",
+      "No rows matched. Check the search columns against the table, or try a " +
+      "shorter term (prefix and substring matches are allowed)."));
+    return;
+  }
+
+  const cols = Object.keys(body.hits[0]);
+  const table = node("table");
+
+  const thead = document.createElement("thead");
+  const headRow = document.createElement("tr");
+  for (const c of cols) {
+    const th = document.createElement("th");
+    th.textContent = c;
+    headRow.appendChild(th);
+  }
+  thead.appendChild(headRow);
+  table.appendChild(thead);
+
+  const tbody = document.createElement("tbody");
+  for (const row of body.hits) {
+    const tr = document.createElement("tr");
+    for (const c of cols) {
+      const td = document.createElement("td");
+      td.textContent = row[c] === null ? "null" : String(row[c]);
+      tr.appendChild(td);
+    }
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+  el.appendChild(table);
+}
+
 // ---- wiring -----------------------------------------------------------------
 
 $("search-btn").onclick = () => runSearch(true);
@@ -339,10 +455,17 @@ $("refresh-indices").onclick = loadIndices;
 $("add-doc-btn").onclick = addDoc;
 $("load-sample").onclick = loadSample;
 $("load-courses").onclick = loadCourses;
+$("db-search-btn").onclick = runDBSearch;
+$("db-query").addEventListener("keydown", (e) => { if (e.key === "Enter") runDBSearch(); });
 
 loadIndices();
 $("backend").textContent = API_BASE;
 $("searchbox").focus();
+
+// Bring up the database panel only if the backend actually has a DB linked.
+loadDBTables()
+  .then(() => runDBSearch())
+  .catch(() => { $("db-panel").style.display = "none"; });
 </script>
 </body>
 </html>

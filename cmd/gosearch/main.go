@@ -2,11 +2,15 @@
 //
 // Usage:
 //
-//	gosearch [-addr :9200]
+//	gosearch [-addr :9200] [-db sn.db]
+//
+// With -db, the server links the SQLite file and exposes the /api/db/tables and
+// /api/db/search endpoints used by the console's database-search panel.
 package main
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"flag"
 	"log"
@@ -16,16 +20,36 @@ import (
 	"syscall"
 	"time"
 
+	_ "modernc.org/sqlite"
+
 	"gosearch/pkg/api"
+	"gosearch/pkg/gosearcher"
 	"gosearch/pkg/search"
 	"gosearch/pkg/storage"
 )
 
 func main() {
 	addr := flag.String("addr", ":9200", "HTTP listen address")
+	dbPath := flag.String("db", "", "path to a SQLite file to link for table search (e.g. sn.db)")
 	flag.Parse()
 
 	server := api.NewServer(storage.NewStore(), search.NewIndex())
+
+	if *dbPath != "" {
+		db, err := sql.Open("sqlite", *dbPath)
+		if err != nil {
+			log.Fatalf("opening %s: %v", *dbPath, err)
+		}
+		defer db.Close()
+
+		gs := gosearcher.NewGoSearcher().LinkDB(db)
+		// Fail fast on a dud path or unreadable file instead of serving 500s.
+		if _, err := gs.ListTables(context.Background()); err != nil {
+			log.Fatalf("linked database %s is unusable: %v", *dbPath, err)
+		}
+		server.WithDB(gs)
+		log.Printf("linked database %s for table search", *dbPath)
+	}
 
 	httpServer := &http.Server{
 		Addr:    *addr,

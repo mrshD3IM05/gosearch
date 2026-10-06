@@ -2,7 +2,7 @@
 
 A small, dependency-free search engine written in **Go**, built from scratch for teaching how search engines work.
 
-Instead of wrapping Lucene, Bleve, or Elasticsearch, every component — tokenizer, inverted index, posting lists, scoring, HTTP API — is implemented directly. The standard library is the only dependency.
+Instead of wrapping Lucene, Bleve, or Elasticsearch, every component — tokenizer, inverted index, posting lists, scoring, HTTP API — is implemented directly. The search core uses only the standard library; `cmd/gosearch -db ...` and `cmd/sqlsearch` add the pure-Go `modernc.org/sqlite` driver (no CGO).
 
 ## Features
 
@@ -14,6 +14,7 @@ Instead of wrapping Lucene, Bleve, or Elasticsearch, every component — tokeniz
 - **AND queries** — all query tokens must match; expansion happens per token
 - **Tiered scoring** — exact term matches outrank prefix matches (`key`→`keyboard`, ×0.4), which outrank substring matches (`key`→`cockey`, ×0.15)
 - **Standalone live-test console** — the frontend is a separate unit in `/web`, served on its own port, so you can edit and test against a running engine with no rebuild
+- **Database column-mode search** — `GoSearcher.LinkDB(db)` attaches a `*sql.DB`; `SearchTable` names a table, the **1+ columns to search by**, and the **1+ columns to return**, reading live rows
 - **Sample corpus** — 1,011 course titles (including deliberate typo variants for fuzzy-search work) loadable in one click
 - **Concurrency-safe** — clean under `go test -race`
 
@@ -43,12 +44,14 @@ HTTP API (pkg/api)
 ```
 package layout
 ├── cmd/gosearch              backend server: POST /samples, doc + search APIs
+├── cmd/sqlsearch             link a SQLite file (e.g. sn.db) and search tables by columns
 ├── cmd/webtest               static server for the live-test console (terminal 2)
 ├── pkg/analyze               tokenizer (Phase 2)
 ├── pkg/search                inverted index, prefix expansion, TF-IDF scoring (Phase 3+)
 ├── pkg/storage               in-memory document store (Phase 1)
 ├── pkg/samples               1,011-title embedded search corpus
 ├── pkg/api                   REST handlers + CORS layer
+├── pkg/gosearcher            GoSearcher: LinkDB + per-table column search
 └── web/                      standalone single-page console (no build step, no CDN)
 ```
 
@@ -74,8 +77,8 @@ Both indexing and querying run the **same tokenizer**, so a query term and an in
 The engine and the console are separate processes; live testing is the default workflow.
 
 ```sh
-# terminal 1 — the backend
-go run ./cmd/gosearch                # → gosearch listening on :9200
+# terminal 1 — the backend (add -db sn.db to enable database table search)
+go run ./cmd/gosearch                 # or: go run ./cmd/gosearch -db sn.db
 
 # terminal 2 — the live-test console
 go run ./cmd/webtest                 # → webtest serving web/ on http://localhost:5000
@@ -103,6 +106,8 @@ Once loaded, try:
 | `GET` | `/index/{index}/{id}` | retrieve a document |
 | `DELETE` | `/index/{index}/{id}` | delete a document |
 | `GET` | `/api/search?index={index}&q={query}&limit={n}` | AND search over the inverted index |
+| `GET` | `/api/db/tables` | list tables/views of the linked database (only with `-db`) |
+| `GET` | `/api/db/search?table={t}&q={query}&search={cols}&return={cols}&limit={n}` | search rows of a table, matching `search` columns, returning `return` columns (only with `-db`) |
 | `POST` | `/samples?index={index}` | bulk-index the embedded course corpus (default index `courses`) |
 
 Every response includes CORS headers and OPTIONS preflights, so the standalone
@@ -125,6 +130,9 @@ curl 'localhost:9200/api/search?index=products&q=wireless+keyboard'
 # Load 1,011 course titles into the "courses" index
 curl -X POST 'localhost:9200/samples?index=courses'
 
+# Database table search (backend started with -db sn.db)
+curl 'localhost:9200/api/db/search?table=posts&q=sunset+rooftop&search=content&return=id,content,created_at'
+
 # Delete it
 curl -X DELETE localhost:9200/index/products/1
 ```
@@ -145,6 +153,58 @@ Example response:
   ]
 }
 ```
+
+## Searching a database table
+
+Beyond pushed documents, `pkg/gosearcher` talks to a database directly. A
+`GoSearcher` holds a reference to a `*sql.DB` (via a small `Querier`
+interface), and `SearchTable` lets you name the table, the **1+ columns to
+search on**, and the **1+ columns to return**. Rows are read live from the
+database on every call, so results always reflect current data — no `PUT`
+export step.
+
+```go
+db, _ := sql.Open("sqlite3", "shop.db") // any *sql.DB / Querier
+gs := gosearcher.NewGoSearcher().LinkDB(db)
+
+results, total, err := gs.SearchTable(context.Background(), gosearcher.TableSearch{
+    Table:      "products",
+    Query:      "wireless keyboard",
+    SearchCols: []string{"name", "description"}, // only these are matched
+    ReturnCols: []string{"id", "sku", "price"},  // only these come back
+    Limit:      20,
+})
+```
+
+- Only `SearchCols` affect matching (a term hiding in another column never matches).
+- `ReturnCols` controls the result maps; empty means "every column".
+- Scoring is the same tiered TF-IDF as everywhere else (exact > prefix > substring).
+- `LinkDB` accepts a `*sql.DB` and adapts it internally, so any driver works; the tool below uses the bundled pure-Go SQLite driver.
+
+Try it against a real social-network database with the `sqlsearch` tool
+(`sn.db` at the repo root has posts, comments, messages, groups, and more):
+
+```sh
+go run ./cmd/sqlsearch -db sn.db -tables
+
+# AND over two terms, searching only the content column
+go run ./cmd/sqlsearch -db sn.db -table posts -query "sunset rooftop" \
+     -search content -return id,content,created_at -limit 4
+
+# prefix matching ("congr" finds "Congrats…")
+go run ./cmd/sqlsearch -db sn.db -table comments -query congr \
+     -search content -return id,content -limit 4
+
+# multi-column search, few return columns
+go run ./cmd/sqlsearch -db sn.db -table users -query ibrah \
+     -search first_name,last_name -return id,first_name,last_name,email
+```
+
+The same search is exposed over HTTP and drives the console's **Database table
+search** panel. Start the backend with `-db sn.db`, open
+<http://localhost:5000>, and the panel appears below the document tools — pick
+a table, the search columns, the return columns, and the term; results render
+as a table with the true total. Without `-db`, the panel is hidden.
 
 ## Development
 
@@ -167,9 +227,11 @@ Implemented:
 - [x] Document storage (in-memory) + HTTP CRUD
 - [x] Unicode-aware tokenizer with byte offsets and positions
 - [x] Inverted index (posting lists + forward index + term dictionary)
-- [x] AND search with exact + prefix matching
+- [x] AND search with exact, prefix and substring matching (tiered penalties)
 - [x] TF-IDF scoring
 - [x] Standalone live-test console (`/web`) + sample corpora
+- [x] Database-backed search: `GoSearcher.LinkDB(db)` + `SearchTable` with **1+ search columns** and **1+ return columns**, reading live rows (see "Searching a database table")
+- [x] Unselected columns never influence matching, and unrequested columns never leak into results
 
 Planned (educational order):
 - [ ] Phrase queries (positions are already stored)
@@ -181,21 +243,20 @@ Planned (educational order):
 - [ ] Segments, disk persistence, and segment merging
 - [ ] Sharding and distributed result merging
 
-Planned — talk to a real database (SQL round-trip):
+Planned — deeper database integration (`pkg/gosearcher` exists):
 
-Today documents must be pushed into gosearch one by one with `PUT`. The goal
-below is to cut the database out of that loop entirely: gosearch reads rows
-straight from a database, and the user decides which columns are searchable
-and which columns come back.
+The GoSearcher already reads rows straight from a database with `LinkDB` and
+let the user pick which columns to match and return — and that choice is now
+exposed over HTTP (`/api/db/search` with `search=` and `return=` CSV params,
+wired into the live-test console). Remaining database work, in dependency
+order:
 
-- [ ] Connect directly to a database (SQLite first, then Postgres/MySQL) and index its tables/rows automatically, with no manual `PUT` export step
-- [ ] Let the user pick **1+ columns to search on** — e.g. `GET /api/search?index=products&search_columns=name,description&q=...` (only listed columns are analyzed and matched)
-- [ ] Let the user pick **1+ columns to return** — e.g. `return_columns=id,name,price` (responses carry exactly those columns, not the whole document)
-- [ ] Keep score columns usable alongside row data (return `_score` even when arbitrary columns are selected)
-- [ ] Auto-map database schema to indices: table → index, row → document, column → field
-- [ ] Respect primary keys so updates in the database overwrite (not duplicate) documents
-- [ ] Live sync: re-index on database writes (polling, then change data capture) so searches always match the current rows
-- [ ] Respect the user's column list when *storing* too: unselected columns are not memory-costly and never leak into results
+- [x] Expose the same column choices over HTTP — `search=` and `return=` CSV params on `/api/db/search`, with a table picker in the console
+- [ ] Generalize the HTTP endpoint to the document `/api/search` (which operates on pushed JSON documents, not live table rows) — today table search is a separate, documented endpoint
+- [ ] Return a score column along with row data when requested (table results today carry exactly `ReturnCols`)
+- [ ] Auto-map schema into indices: table → index, row → document, column → field (today the column lists are explicit)
+- [ ] Respect primary keys so database updates overwrite rather than duplicate documents
+- [ ] Incremental live sync — poll or capture changes to re-index only what changed (today every `SearchTable` re-reads the whole table, which is correct but not incremental)
 
 ## License
 
