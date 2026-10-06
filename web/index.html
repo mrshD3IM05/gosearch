@@ -76,7 +76,7 @@
   </div>
 
   <div class="search">
-    <input id="searchbox" type="search" placeholder="Search terms… (AND, prefix matching) — try: key">
+    <input id="searchbox" type="search" placeholder="Search terms… (AND, prefix + substring matching) — try: key">
     <button id="search-btn">Search</button>
   </div>
 
@@ -173,8 +173,10 @@ async function runSearch(immediate) {
   if (!q) {
     resultsEl.textContent = "";
     const hint = node("p", "hint",
-      "Type terms above. All terms must match (AND) and a term also matches " +
-      "longer words starting with it (\u201Ckey\u201D finds \u201Ckeyboard\u201D).");
+      "Type terms above. All terms must match (AND); a term matches whole words, " +
+      "words starting with it (\u201Ckey\u201D finds \u201Ckeyboard\u201D), and even words " +
+      "that merely contain it (\u201Ckey\u201D finds \u201Ccockey\u201D) — exact first, " +
+      "then prefix, then substring, by score.");
     resultsEl.appendChild(hint);
     return;
   }

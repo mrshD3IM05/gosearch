@@ -323,9 +323,10 @@ func TestPrefixMatchPenalty(t *testing.T) {
 	}
 }
 
-// TestPrefixMatchRequiresTermInDictionary: a token with no matching dictionary
-// term (exact or prefix) rules out every document.
-func TestPrefixMatchRequiresTermInDictionary(t *testing.T) {
+// TestMatchRequiresTermInDictionary: a token needs an exact, prefix, or
+// substring dictionary match. Substrings count (mid-word), but a token with no
+// match at all rules out every document.
+func TestMatchRequiresTermInDictionary(t *testing.T) {
 	ix := NewIndex()
 	ix.Add("idx", "1", map[string]any{"text": "keyboard"})
 
@@ -333,14 +334,55 @@ func TestPrefixMatchRequiresTermInDictionary(t *testing.T) {
 		t.Errorf("keyboard: total = %d, want 1", total)
 	}
 	if _, total := ix.Search("idx", "key", 10); total != 1 {
-		t.Errorf("key: total = %d, want 1", total)
+		t.Errorf("key: total = %d, want 1 (prefix)", total)
+	}
+	if _, total := ix.Search("idx", "board", 10); total != 1 {
+		t.Errorf("board: total = %d, want 1 (substring of keyboard)", total)
+	}
+	if _, total := ix.Search("idx", "eybo", 10); total != 1 {
+		t.Errorf("eybo: total = %d, want 1 (interior substring)", total)
 	}
 	if _, total := ix.Search("idx", "keyz", 10); total != 0 {
-		t.Errorf("keyz: total = %d, want 0 (no term starts with keyz)", total)
+		t.Errorf("keyz: total = %d, want 0 (no matching dictionary term)", total)
 	}
-	if _, total := ix.Search("idx", "board", 10); total != 0 {
-		// "board" is a SUBstring but not a prefix of "keyboard": must match nothing.
-		t.Errorf("board: total = %d, want 0 (prefix, not substring)", total)
+}
+
+// TestSubstringMatchFindsContainingTerms: "key" must also find docs whose term
+// merely CONTAINS the token mid-word ("cockey", "monkey"), ranking below both
+// the exact and the prefix matches.
+func TestSubstringMatchFindsContainingTerms(t *testing.T) {
+	ix := NewIndex()
+	ix.Add("idx", "exact", map[string]any{"text": "key"})
+	ix.Add("idx", "prefix", map[string]any{"text": "keyboard"})
+	ix.Add("idx", "substr", map[string]any{"text": "cockey"})
+	ix.Add("idx", "substr2", map[string]any{"text": "monkey"})
+
+	got, total := ix.Search("idx", "key", 10)
+	if total != 4 {
+		t.Fatalf("total = %d, want 4", total)
+	}
+	if !equalStrings(hits(got), []string{"exact", "prefix", "substr", "substr2"}) {
+		t.Errorf("order = %v, want [exact prefix substr substr2]", hits(got))
+	}
+	if got[0].Score <= got[1].Score || got[1].Score <= got[2].Score {
+		t.Errorf("scores = %v, want exact > prefix > substring", got)
+	}
+}
+
+// TestSubstringMatchPenalty: with identical tf and df, a substring-only
+// contribution is exactly substringPenalty × the exact one.
+func TestSubstringMatchPenalty(t *testing.T) {
+	ix := NewIndex()
+	ix.Add("idx", "a", map[string]any{"text": "key"})
+	ix.Add("idx", "b", map[string]any{"text": "cockey"})
+
+	got, _ := ix.Search("idx", "key", 10)
+	if len(got) != 2 {
+		t.Fatalf("hits = %d, want 2", len(got))
+	}
+	ratio := got[1].Score / got[0].Score
+	if math.Abs(ratio-substringPenalty) > 1e-9 {
+		t.Errorf("ratio = %v, want %v (substring penalty)", ratio, substringPenalty)
 	}
 }
 

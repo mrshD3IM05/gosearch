@@ -480,6 +480,36 @@ func TestSearchEndpointPrefixMatching(t *testing.T) {
 	}
 }
 
+// TestSearchEndpointSubstringMatching: "key" also finds documents whose words
+// merely CONTAIN it ("monkey"), ranked below exact and prefix matches.
+func TestSearchEndpointSubstringMatching(t *testing.T) {
+	h, _ := newTestServer(t)
+
+	doJSON(t, h, http.MethodPut, "/index/products/1", `{"name":"key"}`)
+	doJSON(t, h, http.MethodPut, "/index/products/2", `{"name":"keyboard"}`)
+	doJSON(t, h, http.MethodPut, "/index/products/3", `{"name":"monkey"}`)
+
+	res, body := searchGET(t, h, "index=products&q=key")
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %v", res.StatusCode, body)
+	}
+	if body["total"] != float64(3) {
+		t.Fatalf("total = %v, want 3", body["total"])
+	}
+	hits := body["hits"].([]any)
+	first := hits[0].(map[string]any)
+	second := hits[1].(map[string]any)
+	third := hits[2].(map[string]any)
+	if first["_id"] != "1" || second["_id"] != "2" || third["_id"] != "3" {
+		t.Errorf("order = %v, %v, %v; want 1 (exact), 2 (prefix), 3 (substring)",
+			first["_id"], second["_id"], third["_id"])
+	}
+	if third["_score"].(float64) >= second["_score"].(float64) {
+		t.Errorf("substring score %v should be below prefix score %v",
+			third["_score"], second["_score"])
+	}
+}
+
 func TestSearchEndpointUnicodeQuery(t *testing.T) {
 	h, _ := newTestServer(t)
 

@@ -8,10 +8,11 @@ Instead of wrapping Lucene, Bleve, or Elasticsearch, every component — tokeniz
 
 - **Document API** — index, retrieve, and delete JSON documents into named indices
 - **Inverted index** — term → posting lists with *document IDs and token positions*
-- **Term dictionary** — sorted vocabulary enabling **prefix matching** (`key` finds `keyboard`)
+- **Term dictionary** — sorted vocabulary enabling **prefix + substring matching**, ranked (`key` finds `keyboard`, and even `monkey`, at a lower score)
 - **Unicode-aware tokenizer** — lowercase, punctuation-aware, works on non-ASCII text (French, Cyrillic, CJK)
 - **TF-IDF ranking** — documents scored by term frequency and inverse document frequency
 - **AND queries** — all query tokens must match; expansion happens per token
+- **Tiered scoring** — exact term matches outrank prefix matches (`key`→`keyboard`, ×0.4), which outrank substring matches (`key`→`cockey`, ×0.15)
 - **Standalone live-test console** — the frontend is a separate unit in `/web`, served on its own port, so you can edit and test against a running engine with no rebuild
 - **Sample corpus** — 1,011 course titles (including deliberate typo variants for fuzzy-search work) loadable in one click
 - **Concurrency-safe** — clean under `go test -race`
@@ -25,7 +26,7 @@ HTTP API (pkg/api)
    └── GET /api/search           →  pkg/search   (query engine)
                                         │
                               pkg/search (inverted index)
-                              ├── term dictionary  (sorted terms → prefix lookup)
+                              ├── term dictionary  (sorted terms → exact/prefix/substring expansion)
                               ├── posting lists    (docID + positions per term)
                               └── forward index    (doc → its terms, for updates/deletes)
                                         │
@@ -59,14 +60,14 @@ Both indexing and querying run the **same tokenizer**, so a query term and an in
 
 1. **Tokenize** — text is normalized with `StandardTokenizer`: Unicode letters/digits form tokens, everything else splits; terms are lowercased. Byte offsets are kept for highlighting later.
 2. **Index** — each token updates its posting list with the document ID and the token position. Every document's terms are recorded in a forward index so updates and deletes can expire the right postings.
-3. **Query** — query tokens are tokenized identically, then each token is *expanded* against the term dictionary to exact matches and longer terms that start with it. A document must match **all** tokens (AND).
+3. **Query** — query tokens are tokenized identically, then each token is *expanded* against the term dictionary to exact matches, terms that start with it, and terms that merely contain it. A document must match **all** tokens (AND).
 4. **Score** — classic TF-IDF:
 
    ```
    score(doc, query) = Σ over query tokens  max over matched terms ( tf(term, doc) · ln(1 + N / df(term)) )
    ```
 
-   Exact matches score at full weight; prefix-only matches are scaled by a penalty (`0.4`) so exact hits rank above fuzzy ones.
+   Each match tier carries a penalty: exact terms score at full weight, prefix-only matches (`key` in `keyboard`) are scaled by `0.4`, and substring-only matches (`key` in `cockey`) by `0.15`. So a document containing the token verbatim always ranks above one matching only partially, no matter how often the looser term repeats.
 
 ## Getting started
 
@@ -88,7 +89,7 @@ reload — no build step, no embed to regenerate.
 
 Once loaded, try:
 
-- `keyboard` — exact and prefix matches, ranked
+- `key` — exact, prefix and substring matches, ranked (`key` → `key`, `keyboard`, `monkey`)
 - `elasticsearch ranking` — AND semantics
 - `concurr` — prefix expansion
 
@@ -176,7 +177,7 @@ Planned (educational order):
 - [ ] Booleans: `OR` / `NOT`
 - [ ] Stop-word removal and analyzers
 - [ ] BM25 ranking (avg document length is already maintained)
-- [ ] Fuzzy / typo-tolerant matching (typo variants are in the sample corpus)
+- [ ] Edit-distance typo matching (substring matching — `key` in `cockey` — is already implemented; this adds tolerance for spelling errors, e.g. `keybord` → `keyboard`)
 - [ ] Segments, disk persistence, and segment merging
 - [ ] Sharding and distributed result merging
 

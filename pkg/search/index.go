@@ -15,9 +15,11 @@
 //
 // Query understanding is intentionally minimal: the query string is run
 // through the same StandardTokenizer used at index time and all tokens must
-// match (AND). A token matches a document through an exact dictionary term or
-// a prefix of one (so "key" finds "keyboard"), with exact matches scoring
-// higher. Not yet supported, left for later phases:
+// match (AND). A token matches a document through an exact dictionary term, a
+// term that starts with it (so "key" finds "keyboard"), or — with the lowest
+// weight — a term containing it anywhere ("key" also finds "monkey"). Exact
+// matches score highest, then prefix matches, then substring matches. Not yet
+// supported, left for later phases:
 //
 //   - phrase queries (positions are already stored, enabling them)
 //   - per-field queries such as title:widget (postings are field-agnostic)
@@ -60,7 +62,7 @@ type Index struct {
 	postings map[string]map[string][]Posting // index name → term → postings
 	docTerms map[string]map[string][]string  // index name → docID → unique terms
 	docLen   map[string]map[string]int       // index name → docID → token count
-	termDict map[string][]string             // index name → sorted unique terms (prefix lookup)
+	termDict map[string][]string             // index name → sorted unique terms (match expansion)
 }
 
 // NewIndex creates an empty inverted index.
@@ -133,10 +135,16 @@ func (ix *Index) Delete(index, docID string) bool {
 	return true
 }
 
-// prefixPenalty scales the score of a query token that matched a document
-// only through a prefix-expanded term (i.e. the index term is longer than the
-// query token). Exact term matches keep a penalty of 1.
-const prefixPenalty = 0.4
+// Match-kind penalties scale the contribution of a query token that matched a
+// document only through an expanded term. Exact term matches keep a penalty
+// of 1. A prefix match — the index term starts with the token, e.g. "key" in
+// "keyboard" — costs prefixPenalty. A substring match — the token appears
+// mid-word, e.g. "key" in "cockey" — costs even less, so close matches always
+// outrank loose ones at equal tf/idf.
+const (
+	prefixPenalty    = 0.4
+	substringPenalty = 0.15
+)
 
 // Search scores documents in index against the query and returns up to limit
 // hits sorted by descending score (ties broken by DocID for determinism),
@@ -144,8 +152,9 @@ const prefixPenalty = 0.4
 //
 // Semantics: the query is tokenized with the standard analyzer and a document
 // must contain ALL query tokens (AND). A query token matches a document if the
-// document contains ANY index term that equals the token (exact match) or
-// starts with it (prefix match) — so "key" finds "keyboard".
+// document contains ANY index term that equals the token (exact match), starts
+// with it (prefix match, "key" finds "keyboard"), or contains it mid-word
+// (substring match, "key" finds "monkey" or "cockey").
 //
 // Scoring is classic TF-IDF over each matched index term:
 //
@@ -154,10 +163,11 @@ const prefixPenalty = 0.4
 //
 // where tf is the number of occurrences, N the number of documents in the
 // index, and df the number of documents containing the term. tf rewards
-// repetition; ln(1 + N/df) rewards rarity. When a token matched only via a
-// longer prefix term the whole token contribution is multiplied by
-// prefixPenalty, so exact matches outrank prefix-only ones. limit <= 0 means
-// "no limit".
+// repetition; ln(1 + N/df) rewards rarity. A token's contribution is
+// multiplied by the penalty of its closest expansion tier: 1 for an exact
+// term, prefixPenalty for a prefix-only term, substringPenalty for a term that
+// merely contains the token. So exact matches outrank prefix-only ones, and
+// those outrank substring-only ones. limit <= 0 means "no limit".
 func (ix *Index) Search(index, query string, limit int) ([]Hit, int) {
 	ix.mu.RLock()
 	defer ix.mu.RUnlock()
@@ -182,10 +192,7 @@ func (ix *Index) Search(index, query string, limit int) ([]Hit, int) {
 			list := ix.postings[index][e.term]
 			idf := math.Log(1 + n/float64(len(list)))
 			for _, p := range list {
-				c := float64(len(p.Positions)) * idf
-				if !e.exact {
-					c *= prefixPenalty
-				}
+				c := float64(len(p.Positions)) * idf * e.penalty
 				if cur, ok := best[p.DocID]; !ok || c > cur {
 					best[p.DocID] = c
 				}
@@ -232,23 +239,43 @@ func (ix *Index) Search(index, query string, limit int) ([]Hit, int) {
 	return matches, total
 }
 
-// expandedTerm is one index term a query token turned into, plus whether the
-// match was exact (term == token) or a prefix expansion.
+// expandedTerm is one index term a query token expanded to, plus the penalty
+// for that tier of match: 1 for an exact term, prefixPenalty for a term that
+// starts with the token, substringPenalty for a term that merely contains it.
 type expandedTerm struct {
-	term  string
-	exact bool
+	term    string
+	penalty float64
 }
 
-// expandLocked resolves a single query token to all dictionary terms that
-// equal it or start with it. The term dictionary is sorted, so the candidates
-// form one contiguous range: scan from the first term >= token while the
-// prefix holds. Callers must hold mu.
+// expandLocked resolves a single query token to every dictionary term that
+// matches it: exact (term == token), prefix (term starts with token, a
+// contiguous sorted range), or substring (token appears anywhere in the term).
+// Callers must hold mu.
 func (ix *Index) expandLocked(index, token string) []expandedTerm {
 	dict := ix.termDict[index]
-	i := sort.SearchStrings(dict, token)
+	start := sort.SearchStrings(dict, token)
+
 	var out []expandedTerm
-	for ; i < len(dict) && strings.HasPrefix(dict[i], token); i++ {
-		out = append(out, expandedTerm{term: dict[i], exact: dict[i] == token})
+	// The terms starting with token form one contiguous range here.
+	end := start
+	for ; end < len(dict) && strings.HasPrefix(dict[end], token); end++ {
+		penalty := 1.0
+		if dict[end] != token {
+			penalty = prefixPenalty
+		}
+		out = append(out, expandedTerm{term: dict[end], penalty: penalty})
+	}
+	// Substring matches (token mid-word, e.g. "cockey" for "key") live outside
+	// that range, so scan the rest of the dictionary for them. A plain linear
+	// scan is fine for this educational engine; production engines use a
+	// suffix automaton or trigram index here.
+	for i, term := range dict {
+		if i >= start && i < end {
+			continue
+		}
+		if strings.Contains(term, token) {
+			out = append(out, expandedTerm{term: term, penalty: substringPenalty})
+		}
 	}
 	return out
 }
