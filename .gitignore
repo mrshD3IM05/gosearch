@@ -1,0 +1,16 @@
+# Build output
+/bin/
+/gosearch
+*.exe
+*.exe~
+
+# Test / coverage artifacts
+coverage.out
+coverage.html
+*.prof
+
+# Editor / OS cruft
+.DS_Store
+.vscode/
+.idea/
+*.swp

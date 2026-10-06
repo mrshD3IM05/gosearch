@@ -1,0 +1,346 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gosearch — live test console</title>
+<style>
+  :root {
+    --bg: #14161a; --panel: #1d2026; --border: #2c313a;
+    --text: #e6e8ec; --muted: #9aa3b2; --accent: #4f8cff; --danger: #e05252;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 860px; margin: 0 auto; padding: 24px 16px 80px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-weight: normal; font-size: 13px; }
+  .toolbar, .search { display: flex; gap: 8px; margin: 12px 0; }
+  input, textarea, button {
+    background: var(--panel); color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px;
+    font: inherit;
+  }
+  input:focus, textarea:focus { outline: none; border-color: var(--accent); }
+  #index { width: 200px; }
+  #searchbox { flex: 1; }
+  button { cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button:disabled { opacity: .5; cursor: default; }
+  .results { margin-top: 4px; }
+  .hint, .total { color: var(--muted); font-size: 13px; margin: 8px 0; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 8px; padding: 12px 14px; margin-bottom: 10px;
+  }
+  .card-head { display: flex; align-items: center; gap: 10px; }
+  .card-id { font-weight: 600; }
+  .score {
+    color: var(--accent); font-size: 12px; font-variant-numeric: tabular-nums;
+  }
+  .card pre {
+    margin: 8px 0 0; overflow-x: auto; font-size: 13px;
+    color: var(--muted); background: var(--bg); border-radius: 6px; padding: 8px;
+  }
+  .del {
+    margin-left: auto; color: var(--danger); background: transparent;
+    border-color: transparent; font-size: 12px;
+  }
+  .del:hover { border-color: var(--danger); }
+  .tools h2 { font-size: 16px; margin: 32px 0 8px; }
+  .add-doc { display: flex; flex-direction: column; gap: 8px; max-width: 520px; }
+  #doc-json { font-family: ui-monospace, Consolas, monospace; resize: vertical; }
+  #status {
+    position: fixed; left: 50%; bottom: 16px; transform: translateX(-50%);
+    padding: 8px 16px; border-radius: 6px; font-size: 13px; opacity: 0;
+    transition: opacity .15s; pointer-events: none; max-width: 90%;
+  }
+  #status.show { opacity: 1; }
+  #status.ok { background: #173a24; border: 1px solid #2c7a47; color: #7ddb9d; }
+  #status.err { background: #3a1717; border: 1px solid #b04a4a; color: #f0a0a0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>gosearch <span class="sub">live test console — backend on
+    <span id="backend"></span></span></h1>
+
+  <div class="toolbar">
+    <label>index
+      <input id="index" list="indices" value="products" spellcheck="false">
+    </label>
+    <datalist id="indices"></datalist>
+    <button id="refresh-indices">refresh indices</button>
+  </div>
+
+  <div class="search">
+    <input id="searchbox" type="search" placeholder="Search terms… (AND, prefix matching) — try: key">
+    <button id="search-btn">Search</button>
+  </div>
+
+  <section id="results" class="results"></section>
+
+  <section class="tools">
+    <h2>Document tools</h2>
+    <div class="add-doc">
+      <label>document ID (leave blank for a generated one)
+        <input id="doc-id" placeholder="auto" spellcheck="false" style="width:100%;margin-top:4px">
+      </label>
+      <textarea id="doc-json" rows="6" placeholder='{"name":"Gadget X","description":"..."}'></textarea>
+      <div>
+        <button id="add-doc-btn">Index document</button>
+        <button id="load-sample">Load sample data (products)</button>
+        <button id="load-courses">Load course titles</button>
+      </div>
+    </div>
+  </section>
+</main>
+
+<div id="status"></div>
+
+<script>
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+const resultsEl = $("results");
+const statusEl = $("status");
+
+// The console is a standalone live-test unit (cmd/webtest or file://). Point
+// this at the backend you are testing; CORS is enabled on the backend so any
+// origin can call it.
+const API_BASE = "http://localhost:9200";
+
+let searchTimer = null;
+let searchSeq = 0; // guards against out-of-order responses
+
+// ---- low-level HTTP helpers -------------------------------------------------
+
+async function req(path, opts = {}) {
+  const res = await fetch(API_BASE + path, opts);
+  if (!res.ok) {
+    let reason = res.status + " " + res.statusText;
+    try {
+      const body = await res.json();
+      if (body.error && body.error.reason) reason = body.error.reason;
+    } catch (_) { /* non-JSON error body */ }
+    throw new Error(reason);
+  }
+  const ct = res.headers.get("content-type") || "";
+  return ct.includes("json") ? res.json() : res.text();
+}
+
+function showStatus(msg, kind) {
+  statusEl.textContent = msg;
+  statusEl.className = "show " + kind;
+  clearTimeout(showStatus._t);
+  showStatus._t = setTimeout(() => statusEl.className = "", 2500);
+}
+
+// Escaping: every dynamic value is inserted via textContent or JSON
+// serialization, so we never build HTML strings from user data.
+function node(tag, cls, text) {
+  const el = document.createElement(tag);
+  if (cls) el.className = cls;
+  if (text !== undefined) el.textContent = text;
+  return el;
+}
+
+// ---- indices ----------------------------------------------------------------
+
+async function loadIndices() {
+  try {
+    const body = await req("/index");
+    const list = $("indices");
+    list.textContent = "";
+    for (const name of body.indices) {
+      const opt = node("option");
+      opt.value = name;
+      list.appendChild(opt);
+    }
+  } catch (e) {
+    showStatus("could not load indices: " + e.message, "err");
+  }
+}
+
+// ---- search -----------------------------------------------------------------
+
+function currentIndex() { return $("index").value.trim() || "products"; }
+
+async function runSearch(immediate) {
+  const q = $("searchbox").value.trim();
+  if (!q) {
+    resultsEl.textContent = "";
+    const hint = node("p", "hint",
+      "Type terms above. All terms must match (AND) and a term also matches " +
+      "longer words starting with it (\u201Ckey\u201D finds \u201Ckeyboard\u201D).");
+    resultsEl.appendChild(hint);
+    return;
+  }
+  if (immediate) { clearTimeout(searchTimer); }
+  else {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => runSearch(true), 300);
+    return;
+  }
+
+  const seq = ++searchSeq;
+  const query = new URLSearchParams({
+    index: currentIndex(), q: q, limit: "20",
+  });
+  try {
+    const body = await req("/api/search?" + query.toString());
+    if (seq !== searchSeq) return; // a newer search superseded this one
+    renderResults(body);
+  } catch (e) {
+    if (seq !== searchSeq) return;
+    resultsEl.textContent = "";
+    resultsEl.appendChild(node("p", "hint", "search failed: " + e.message));
+  }
+}
+
+function renderResults(body) {
+  const q = $("searchbox").value.trim();
+  resultsEl.textContent = "";
+
+  const total = node("p", "total",
+    body.total + " match" + (body.total === 1 ? "" : "es") +
+    " for \u201C" + q + "\u201D in \u201C" + body.index + "\u201D");
+  resultsEl.appendChild(total);
+
+  if (body.total === 0) {
+    // Common first-run trap: nothing indexed yet. Point at the escape hatch.
+    const hint = node("p", "hint",
+      "No documents in this index yet. Add one above or click \u201CLoad sample data\u201D.");
+    resultsEl.appendChild(hint);
+  }
+
+  for (const hit of body.hits) {
+    const card = node("div", "card");
+    const head = node("div", "card-head");
+    head.appendChild(node("span", "card-id", hit._id));
+    head.appendChild(node("span", "score", "score " + hit._score.toFixed(4)));
+    const del = node("button", "del", "delete");
+    del.onclick = () => deleteDoc(body.index, hit._id);
+    head.appendChild(del);
+    card.appendChild(head);
+
+    const pre = node("pre");
+    pre.textContent = JSON.stringify(hit.fields, null, 2);
+    card.appendChild(pre);
+    resultsEl.appendChild(card);
+  }
+}
+
+// ---- document tools ---------------------------------------------------------
+
+async function addDoc() {
+  const index = currentIndex();
+  let id = $("doc-id").value.trim();
+  if (!id) id = "doc-" + Date.now();
+
+  let fields;
+  try {
+    fields = JSON.parse($("doc-json").value);
+  } catch (e) {
+    showStatus("document JSON does not parse: " + e.message, "err");
+    return;
+  }
+  if (fields === null || typeof fields !== "object" || Array.isArray(fields)) {
+    showStatus("document must be a JSON object", "err");
+    return;
+  }
+
+  try {
+    await req("/index/" + encodeURIComponent(index) + "/" + encodeURIComponent(id), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(fields),
+    });
+    showStatus("indexed " + index + "/" + id, "ok");
+    $("doc-json").value = "";
+    loadIndices();
+    runSearch(true);
+  } catch (e) {
+    showStatus("index failed: " + e.message, "err");
+  }
+}
+
+async function deleteDoc(index, id) {
+  if (!window.confirm("Delete " + index + "/" + id + "?")) return;
+  try {
+    await req("/index/" + encodeURIComponent(index) + "/" + encodeURIComponent(id), {
+      method: "DELETE",
+    });
+    showStatus("deleted " + index + "/" + id, "ok");
+    loadIndices();
+    runSearch(true);
+  } catch (e) {
+    showStatus("delete failed: " + e.message, "err");
+  }
+}
+
+// Sample docs deliberately repeat key words so TF-IDF ranking is visible:
+// searching "keyboard" must put doc 2 ahead of doc 1.
+const SAMPLE_DOCS = [
+  { name: "Wired Keyboard", description: "A plain wired keyboard", price: 25, tags: ["keyboard", "wired", "input"], in_stock: true },
+  { name: "Mechanical Keyboard, compact wireless keyboard with RGB backlight", description: "Wireless mechanical keyboard. Quiet keys, long battery. Our best keyboard.", price: 89, tags: ["keyboard", "mechanical", "wireless"], in_stock: true },
+  { name: "Ultrabook Laptop 14\"", description: "Thin and light laptop, 16 GB RAM", price: 1199, tags: ["laptop", "computer"], in_stock: true },
+  { name: "Gaming Laptop 17\"", description: "Powerful gaming laptop with a fast GPU", price: 1799, tags: ["laptop", "gaming"], in_stock: false },
+  { name: "Wireless Mouse", description: "Ergonomic wireless mouse", price: 34, tags: ["mouse", "wireless"], in_stock: true },
+  { name: "USB-C Hub 7-in-1", description: "Seven ports: HDMI, USB-A, USB-C, USB-C power", price: 42, tags: ["hub", "usb-c"], in_stock: true },
+  { name: "Noise-cancelling Headphones", description: "Over-ear headphones with active noise cancellation", price: 199, tags: ["headphones", "audio"], in_stock: true },
+  { name: "Espresso Machine", description: "A quality espresso machine for home baristas", price: 349, tags: ["kitchen", "coffee"], in_stock: false },
+];
+
+async function loadSample() {
+  const index = currentIndex();
+  try {
+    for (let i = 1; i <= SAMPLE_DOCS.length; i++) {
+      await req("/index/" + encodeURIComponent(index) + "/" + i, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(SAMPLE_DOCS[i - 1]),
+      });
+    }
+    showStatus("loaded " + SAMPLE_DOCS.length + " sample docs into \u201C" + index + "\u201D", "ok");
+    $("searchbox").value = "keyboard";
+    loadIndices();
+    runSearch(true);
+  } catch (e) {
+    showStatus("sample load failed: " + e.message, "err");
+  }
+}
+
+// Bulk-loads the embedded course-title corpus (thousands of titles,
+// including deliberate typo variants) into the current index.
+async function loadCourses() {
+  const index = currentIndex();
+  try {
+    const body = await req("/samples?index=" + encodeURIComponent(index), { method: "POST" });
+    showStatus("loaded " + body.loaded + " course titles into \u201C" + index + "\u201D", "ok");
+    $("searchbox").value = "elasticsearch ranking";
+    loadIndices();
+    runSearch(true);
+  } catch (e) {
+    showStatus("course load failed: " + e.message, "err");
+  }
+}
+
+// ---- wiring -----------------------------------------------------------------
+
+$("search-btn").onclick = () => runSearch(true);
+$("searchbox").addEventListener("input", () => runSearch(false));
+$("searchbox").addEventListener("keydown", (e) => { if (e.key === "Enter") runSearch(true); });
+$("refresh-indices").onclick = loadIndices;
+$("add-doc-btn").onclick = addDoc;
+$("load-sample").onclick = loadSample;
+$("load-courses").onclick = loadCourses;
+
+loadIndices();
+$("backend").textContent = API_BASE;
+$("searchbox").focus();
+</script>
+</body>
+</html>
