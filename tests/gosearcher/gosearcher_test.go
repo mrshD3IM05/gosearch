@@ -1,15 +1,17 @@
-package gosearcher
+package gosearcher_test
 
 import (
 	"context"
 	"fmt"
 	"strings"
 	"testing"
+
+	"gosearch/pkg/gosearcher"
 )
 
 // ---- in-memory fake database ------------------------------------------------
 
-// fakeRows implements Rows over a slice of rows.
+// fakeRows implements gosearcher.Rows over a slice of rows.
 type fakeRows struct {
 	cols []string
 	rows [][]any
@@ -44,7 +46,20 @@ type fakeDB struct {
 	lastQuery string
 }
 
-func (f *fakeDB) QueryContext(_ context.Context, query string, _ ...any) (Rows, error) {
+type versionedFakeDB struct {
+	fakeDB
+	version int64
+	scans   int
+}
+
+func (f *versionedFakeDB) Version(context.Context) (int64, error) { return f.version, nil }
+
+func (f *versionedFakeDB) QueryContext(ctx context.Context, query string, args ...any) (gosearcher.Rows, error) {
+	f.scans++
+	return f.fakeDB.QueryContext(ctx, query, args...)
+}
+
+func (f *fakeDB) QueryContext(_ context.Context, query string, _ ...any) (gosearcher.Rows, error) {
 	f.lastQuery = query
 	if f.err != nil {
 		return nil, f.err
@@ -52,10 +67,10 @@ func (f *fakeDB) QueryContext(_ context.Context, query string, _ ...any) (Rows, 
 	return &fakeRows{cols: f.cols, rows: f.rows}, nil
 }
 
-func newSearcher(t *testing.T, cols []string, rows [][]any) (*GoSearcher, *fakeDB) {
+func newSearcher(t *testing.T, cols []string, rows [][]any) (*gosearcher.GoSearcher, *fakeDB) {
 	t.Helper()
 	db := &fakeDB{cols: cols, rows: rows}
-	return NewGoSearcher().linkDB(db), db
+	return gosearcher.NewGoSearcher().LinkQuerier(db), db
 }
 
 // ---- tests ------------------------------------------------------------------
@@ -71,7 +86,7 @@ func TestSearchTableReturnsOnlyReturnCols(t *testing.T) {
 			{3, "mechanical keyboard", []string{"keyboard"}, "classified"},
 		})
 
-	out, total, err := gs.SearchTable(context.Background(), TableSearch{
+	out, total, err := gs.SearchTable(context.Background(), gosearcher.TableSearch{
 		Table:      "products",
 		Query:      "keyboard",
 		SearchCols: []string{"name", "tags"},
@@ -106,7 +121,7 @@ func TestSearchTableIgnoresUnselectedColumns(t *testing.T) {
 			{"plain widget", "contains the word secret here"},
 		})
 
-	out, total, err := gs.SearchTable(context.Background(), TableSearch{
+	out, total, err := gs.SearchTable(context.Background(), gosearcher.TableSearch{
 		Table:      "parts",
 		Query:      "secret",
 		SearchCols: []string{"name"},
@@ -127,7 +142,7 @@ func TestSearchTableReturnsAllColumnsWhenUnspecified(t *testing.T) {
 		[]string{"id", "name", "price"},
 		[][]any{{1, "blue fox", 9.99}})
 
-	out, _, err := gs.SearchTable(context.Background(), TableSearch{
+	out, _, err := gs.SearchTable(context.Background(), gosearcher.TableSearch{
 		Table:      "parts",
 		Query:      "fox",
 		SearchCols: []string{"name"},
@@ -154,7 +169,7 @@ func TestSearchTableMatchTiersCarryOver(t *testing.T) {
 			{"unrelated"},
 		})
 
-	out, total, err := gs.SearchTable(context.Background(), TableSearch{
+	out, total, err := gs.SearchTable(context.Background(), gosearcher.TableSearch{
 		Table:      "terms",
 		Query:      "key",
 		SearchCols: []string{"word"},
@@ -179,7 +194,7 @@ func TestSearchTableLimitAndTotal(t *testing.T) {
 	}
 	gs, db := newSearcher(t, []string{"id", "text"}, rows)
 
-	out, total, err := gs.SearchTable(context.Background(), TableSearch{
+	out, total, err := gs.SearchTable(context.Background(), gosearcher.TableSearch{
 		Table:      "logs",
 		Query:      "common",
 		SearchCols: []string{"text"},
@@ -200,22 +215,66 @@ func TestSearchTableLimitAndTotal(t *testing.T) {
 	}
 }
 
+func TestVersionedTableReusesAndRefreshesIndex(t *testing.T) {
+	db := &versionedFakeDB{
+		fakeDB: fakeDB{
+			cols: []string{"id", "name", "description"},
+			rows: [][]any{{1, "wireless keyboard", "first"}, {2, "mouse", "second"}},
+		},
+		version: 1,
+	}
+	gs := gosearcher.NewGoSearcher().LinkQuerier(db)
+	ts := gosearcher.TableSearch{Table: "products", Query: "keyboard", SearchCols: []string{"name"}, ReturnCols: []string{"id"}}
+	if rows, total, err := gs.SearchTable(context.Background(), ts); err != nil || total != 1 || len(rows) != 1 {
+		t.Fatalf("first search: rows=%v total=%d err=%v", rows, total, err)
+	}
+	if db.scans != 1 {
+		t.Fatalf("first search scanned %d times, want 1", db.scans)
+	}
+	ts.Query = "mouse"
+	ts.ReturnCols = []string{"name"}
+	if rows, total, err := gs.SearchTable(context.Background(), ts); err != nil || total != 1 || len(rows) != 1 {
+		t.Fatalf("warm search: rows=%v total=%d err=%v", rows, total, err)
+	}
+	if db.scans != 1 {
+		t.Errorf("warm search scanned again: %d scans", db.scans)
+	}
+
+	db.rows[1][1] = "trackpad"
+	db.version++
+	if rows, total, err := gs.SearchTable(context.Background(), ts); err != nil || total != 0 || len(rows) != 0 {
+		t.Fatalf("search after update: rows=%v total=%d err=%v", rows, total, err)
+	}
+	if db.scans != 2 {
+		t.Errorf("changed table scanned %d times, want 2", db.scans)
+	}
+
+	ts.SearchCols = []string{"description"}
+	ts.Query = "second"
+	if rows, total, err := gs.SearchTable(context.Background(), ts); err != nil || total != 1 || len(rows) != 1 {
+		t.Fatalf("different columns: rows=%v total=%d err=%v", rows, total, err)
+	}
+	if db.scans != 3 {
+		t.Errorf("different search columns scanned %d times, want 3", db.scans)
+	}
+}
+
 // TestSearchTableErrors: missing LinkDB, empty table, no search columns, and
 // unknown columns each fail with a clear message.
 func TestSearchTableErrors(t *testing.T) {
-	mk := func() *GoSearcher {
+	mk := func() *gosearcher.GoSearcher {
 		g, _ := newSearcher(t, []string{"id", "name"}, [][]any{{1, "x"}})
 		return g
 	}
 
-	notLinked := NewGoSearcher()
-	if _, _, err := notLinked.SearchTable(context.Background(), TableSearch{
+	notLinked := gosearcher.NewGoSearcher()
+	if _, _, err := notLinked.SearchTable(context.Background(), gosearcher.TableSearch{
 		Table: "t", Query: "x", SearchCols: []string{"name"},
 	}); err == nil {
 		t.Error("SearchTable before LinkDB: want error")
 	}
 
-	for name, ts := range map[string]TableSearch{
+	for name, ts := range map[string]gosearcher.TableSearch{
 		"empty table":   {Table: "", Query: "x", SearchCols: []string{"name"}},
 		"no searchcol":  {Table: "t", Query: "x"},
 		"bad searchcol": {Table: "t", Query: "x", SearchCols: []string{"nope"}},
@@ -229,21 +288,19 @@ func TestSearchTableErrors(t *testing.T) {
 	}
 }
 
-// TestLinkDBChains: LinkDB returns the receiver for one-line construction.
-func TestLinkDBChains(t *testing.T) {
-	db := &fakeDB{cols: []string{"id", "name"}, rows: [][]any{{1, "chain test"}}}
-	gs := NewGoSearcher().linkDB(db)
-	if gs.db == nil {
-		t.Fatal("linkDB did not attach the database")
-	}
-}
-
 // TestLinkQuerierChains: LinkQuerier attaches any Querier (custom backends,
 // tests) and chains.
 func TestLinkQuerierChains(t *testing.T) {
-	gs := NewGoSearcher().LinkQuerier(&fakeDB{cols: []string{"id", "name"}, rows: [][]any{{1, "x"}}})
-	if gs.db == nil {
-		t.Fatal("LinkQuerier did not attach the database")
+	gs := gosearcher.NewGoSearcher()
+	linked := gs.LinkQuerier(&fakeDB{cols: []string{"id", "name"}, rows: [][]any{{1, "x"}}})
+	if linked != gs {
+		t.Fatal("LinkQuerier did not return the receiver")
+	}
+	rows, total, err := linked.SearchTable(context.Background(), gosearcher.TableSearch{
+		Table: "items", Query: "x", SearchCols: []string{"name"},
+	})
+	if err != nil || total != 1 || len(rows) != 1 {
+		t.Fatalf("linked search: rows=%v total=%d err=%v", rows, total, err)
 	}
 }
 
@@ -253,7 +310,7 @@ func TestListTables(t *testing.T) {
 		cols: []string{"name"},
 		rows: [][]any{{"comments"}, {"posts"}, {"users"}},
 	}
-	gs := NewGoSearcher().linkDB(db)
+	gs := gosearcher.NewGoSearcher().LinkQuerier(db)
 
 	names, err := gs.ListTables(context.Background())
 	if err != nil {
@@ -269,7 +326,7 @@ func TestListTables(t *testing.T) {
 
 // TestListTablesRequiresLink: no LinkDB, no listing.
 func TestListTablesRequiresLink(t *testing.T) {
-	if _, err := NewGoSearcher().ListTables(context.Background()); err == nil {
+	if _, err := gosearcher.NewGoSearcher().ListTables(context.Background()); err == nil {
 		t.Error("ListTables before LinkDB: want error")
 	}
 }

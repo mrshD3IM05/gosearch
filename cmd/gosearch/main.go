@@ -43,6 +43,7 @@ func main() {
 		defer db.Close()
 
 		gs := gosearcher.NewGoSearcher().LinkDB(db)
+		defer gs.Close()
 		// Fail fast on a dud path or unreadable file instead of serving 500s.
 		if _, err := gs.ListTables(context.Background()); err != nil {
 			log.Fatalf("linked database %s is unusable: %v", *dbPath, err)

@@ -1,15 +1,17 @@
-package analyze
+package analyze_test
 
 import (
 	"reflect"
 	"testing"
+
+	"gosearch/pkg/analyze"
 )
 
-// tok is the StandardTokenizer under test; kept short for table-driven cases.
-var tok = StandardTokenizer{}
+// tok is the analyze.StandardTokenizer under test; kept short for table-driven cases.
+var tok = analyze.StandardTokenizer{}
 
 func terms(text string) []string {
-	return Terms(tok, text)
+	return analyze.Terms(tok, text)
 }
 
 // wantEq compares got/want with nil-vs-empty tolerance: an empty input
@@ -125,7 +127,7 @@ func TestTokenizeKeepsNumbers(t *testing.T) {
 }
 
 func TestTokenPositionsAreSequential(t *testing.T) {
-	toks := Collect(tok, "alpha beta gamma")
+	toks := analyze.Collect(tok, "alpha beta gamma")
 	if len(toks) != 3 {
 		t.Fatalf("len = %d, want 3", len(toks))
 	}
@@ -138,7 +140,7 @@ func TestTokenPositionsAreSequential(t *testing.T) {
 
 func TestTokenOffsets(t *testing.T) {
 	text := "The QUICK, brown fox!"
-	toks := Collect(tok, text)
+	toks := analyze.Collect(tok, text)
 
 	want := []struct {
 		term       string
@@ -167,7 +169,7 @@ func TestTokenOffsets(t *testing.T) {
 
 func TestTokenOffsetsAreByteOffsetsForMultibyteText(t *testing.T) {
 	text := "café ok"
-	toks := Collect(tok, text)
+	toks := analyze.Collect(tok, text)
 	if len(toks) != 2 {
 		t.Fatalf("len = %d, want 2: %+v", len(toks), toks)
 	}
@@ -185,7 +187,7 @@ func TestTokenOffsetsAreByteOffsetsForMultibyteText(t *testing.T) {
 
 func TestTokenizeStopsEarlyWhenEmitReturnsFalse(t *testing.T) {
 	var seen []string
-	tok.Tokenize("one two three four", func(tk Token) bool {
+	tok.Tokenize("one two three four", func(tk analyze.Token) bool {
 		seen = append(seen, tk.Term)
 		return len(seen) < 2
 	})
@@ -216,6 +218,6 @@ func BenchmarkStandardTokenizer(b *testing.B) {
 	b.SetBytes(int64(len(text)))
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		tok.Tokenize(text, func(Token) bool { return true })
+		tok.Tokenize(text, func(analyze.Token) bool { return true })
 	}
 }

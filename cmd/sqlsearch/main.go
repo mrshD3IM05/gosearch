@@ -56,6 +56,7 @@ func main() {
 	}
 
 	gs := gosearcher.NewGoSearcher().LinkDB(db)
+	defer gs.Close()
 	results, total, err := gs.SearchTable(context.Background(), gosearcher.TableSearch{
 		Table:      *table,
 		Query:      *query,

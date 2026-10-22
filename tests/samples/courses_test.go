@@ -1,16 +1,18 @@
-package samples
+package samples_test
 
 import (
 	"strings"
 	"testing"
+
+	"gosearch/pkg/samples"
 )
 
 func TestCourseTitles(t *testing.T) {
-	titles := CourseTitles()
+	titles := samples.CourseTitles()
 
 	// The corpus is large enough to be a meaningful test set.
 	if len(titles) < 500 {
-		t.Fatalf("len(CourseTitles()) = %d, want at least 500", len(titles))
+		t.Fatalf("len(samples.CourseTitles()) = %d, want at least 500", len(titles))
 	}
 
 	// Spot-check representative entries that must be present verbatim.
@@ -39,7 +41,7 @@ func TestCourseTitles(t *testing.T) {
 }
 
 func TestCourseTitlesSkipBlankLines(t *testing.T) {
-	for _, s := range CourseTitles() {
+	for _, s := range samples.CourseTitles() {
 		if s == "" || strings.TrimSpace(s) != s {
 			t.Errorf("corpus contains blank or non-trimmed line %q", s)
 		}

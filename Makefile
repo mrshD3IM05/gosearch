@@ -22,10 +22,10 @@ vet:
 	go vet ./...
 
 fmt:
-	gofmt -w ./cmd ./pkg
+	gofmt -w ./cmd ./pkg ./tests
 
 fmt-check:
-	@out=$$(gofmt -l ./cmd ./pkg); \
+	@out=$$(gofmt -l ./cmd ./pkg ./tests); \
 	if [ -n "$$out" ]; then \
 		echo "The following files are not gofmt-formatted:"; \
 		echo "$$out"; \

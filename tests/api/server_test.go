@@ -1,4 +1,4 @@
-package api
+package api_test
 
 import (
 	"context"
@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"gosearch/pkg/api"
 	"gosearch/pkg/gosearcher"
 	"gosearch/pkg/search"
 	"gosearch/pkg/storage"
@@ -20,7 +21,7 @@ import (
 func newTestServer(t *testing.T) (http.Handler, *storage.Store) {
 	t.Helper()
 	store := storage.NewStore()
-	return NewServer(store, search.NewIndex()).Handler(), store
+	return api.NewServer(store, search.NewIndex()).Handler(), store
 }
 
 func doJSON(t *testing.T, h http.Handler, method, path, body string) (*http.Response, map[string]any) {
@@ -295,7 +296,7 @@ func TestCorsHeaders(t *testing.T) {
 func TestPutRejectsOversizedBody(t *testing.T) {
 	h, _ := newTestServer(t)
 
-	body := `{"big":"` + strings.Repeat("x", maxBodyBytes+1024) + `"}`
+	body := `{"big":"` + strings.Repeat("x", 5<<20) + `"}`
 	res, _ := doJSON(t, h, http.MethodPut, "/index/products/1", body)
 	if res.StatusCode != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400 for oversized body", res.StatusCode)
@@ -352,7 +353,7 @@ func (apiFakeDB) QueryContext(_ context.Context, query string, _ ...any) (gosear
 // fake database.
 func newTestServerWithDB(t *testing.T) http.Handler {
 	t.Helper()
-	return NewServer(storage.NewStore(), search.NewIndex()).
+	return api.NewServer(storage.NewStore(), search.NewIndex()).
 		WithDB(gosearcher.NewGoSearcher().LinkQuerier(apiFakeDB{})).
 		Handler()
 }
