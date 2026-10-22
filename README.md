@@ -74,7 +74,14 @@ Both indexing and querying run the **same tokenizer**, so a query term and an in
 
 ## Getting started
 
-The engine and the console are separate processes; live testing is the default workflow.
+The engine and the console are separate processes. Start both with one command:
+
+```sh
+sh ./dev.sh               # API on :9200, console on :5000
+sh ./dev.sh sn.db         # also enable SQLite table search
+```
+
+Press Ctrl+C to stop both. You can also run the processes separately for live testing:
 
 ```sh
 # terminal 1 — the backend (add -db sn.db to enable database table search)
