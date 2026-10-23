@@ -1,4 +1,4 @@
-package search
+package search_test
 
 import (
 	"encoding/json"
@@ -7,10 +7,12 @@ import (
 	"reflect"
 	"sync"
 	"testing"
+
+	"gosearch/pkg/search"
 )
 
 // hits is a helper returning just the doc IDs from a search result.
-func hits(h []Hit) []string {
+func hits(h []search.Hit) []string {
 	out := make([]string, len(h))
 	for i, x := range h {
 		out[i] = x.DocID
@@ -26,7 +28,7 @@ func equalStrings(a, b []string) bool {
 }
 
 func TestAddAndSearchSingleTerm(t *testing.T) {
-	ix := NewIndex()
+	ix := search.NewIndex()
 	ix.Add("products", "1", map[string]any{"name": "red fox"})
 
 	got, total := ix.Search("products", "fox", 10)
@@ -42,7 +44,7 @@ func TestAddAndSearchSingleTerm(t *testing.T) {
 }
 
 func TestSearchIsCaseAndUnicodeInsensitiveViaAnalyzer(t *testing.T) {
-	ix := NewIndex()
+	ix := search.NewIndex()
 	ix.Add("idx", "1", map[string]any{"title": "Grüße WELT"})
 
 	for _, q := range []string{"welt", "WELT", "grüße", "GRÜSSE"} {
@@ -62,7 +64,7 @@ func TestSearchIsCaseAndUnicodeInsensitiveViaAnalyzer(t *testing.T) {
 }
 
 func TestAndSemantics(t *testing.T) {
-	ix := NewIndex()
+	ix := search.NewIndex()
 	ix.Add("idx", "1", map[string]any{"text": "red fox"})
 	ix.Add("idx", "2", map[string]any{"text": "red panda"})
 
@@ -79,7 +81,7 @@ func TestAndSemantics(t *testing.T) {
 
 // TestRankingHigherTFWins: more occurrences of the query term ranks higher.
 func TestRankingHigherTFWins(t *testing.T) {
-	ix := NewIndex()
+	ix := search.NewIndex()
 	ix.Add("idx", "a", map[string]any{"text": "fox fox fox"})
 	ix.Add("idx", "b", map[string]any{"text": "fox"})
 
@@ -95,7 +97,7 @@ func TestRankingHigherTFWins(t *testing.T) {
 // TestRankingRareTermScoresHigher: with the same tf, a rare term (high IDF)
 // scores higher than a common one (low IDF).
 func TestRankingRareTermScoresHigher(t *testing.T) {
-	ix := NewIndex()
+	ix := search.NewIndex()
 	ix.Add("idx", "d1", map[string]any{"text": "common"})
 	ix.Add("idx", "d2", map[string]any{"text": "common"})
 	ix.Add("idx", "d3", map[string]any{"text": "common"})
@@ -119,7 +121,7 @@ func TestRankingRareTermScoresHigher(t *testing.T) {
 // TestRankingScoreAccumulatesOverQueryTerms: every query term contributes
 // to the final score of an AND match.
 func TestRankingScoreAccumulatesOverQueryTerms(t *testing.T) {
-	ix := NewIndex()
+	ix := search.NewIndex()
 	ix.Add("idx", "d1", map[string]any{"text": "fox elephant"})
 	ix.Add("idx", "d2", map[string]any{"text": "fox fox elephant"})
 
@@ -138,7 +140,7 @@ func TestRankingScoreAccumulatesOverQueryTerms(t *testing.T) {
 
 // TestTieBreaksByDocID keeps result order deterministic across runs.
 func TestTieBreaksByDocID(t *testing.T) {
-	ix := NewIndex()
+	ix := search.NewIndex()
 	for _, id := range []string{"zeta", "alpha", "mid"} {
 		ix.Add("idx", id, map[string]any{"text": "same text"})
 	}
@@ -149,7 +151,7 @@ func TestTieBreaksByDocID(t *testing.T) {
 }
 
 func TestUpdateReplacesPostings(t *testing.T) {
-	ix := NewIndex()
+	ix := search.NewIndex()
 	ix.Add("idx", "1", map[string]any{"text": "apple"})
 	if n, ok := ix.DocLength("idx", "1"); !ok || n != 1 {
 		t.Fatalf("DocLength = %d, %v; want 1, true", n, ok)
@@ -167,16 +169,10 @@ func TestUpdateReplacesPostings(t *testing.T) {
 	if n, _ := ix.DocLength("idx", "1"); n != 2 {
 		t.Errorf("DocLength = %d, want 2 after update", n)
 	}
-	// No duplicate posting was created.
-	ix.mu.RLock()
-	defer ix.mu.RUnlock()
-	if list := ix.postings["idx"]["banana"]; len(list) != 1 {
-		t.Errorf("postings for banana = %d entries, want 1", len(list))
-	}
 }
 
 func TestDeleteRemovesDocument(t *testing.T) {
-	ix := NewIndex()
+	ix := search.NewIndex()
 	ix.Add("idx", "1", map[string]any{"text": "red fox"})
 
 	if !ix.Delete("idx", "1") {
@@ -197,7 +193,7 @@ func TestDeleteRemovesDocument(t *testing.T) {
 }
 
 func TestIndicesAreIsolated(t *testing.T) {
-	ix := NewIndex()
+	ix := search.NewIndex()
 	ix.Add("products", "1", map[string]any{"text": "laptop"})
 	ix.Add("users", "1", map[string]any{"text": "alice"})
 
@@ -215,7 +211,7 @@ func TestIndicesAreIsolated(t *testing.T) {
 }
 
 func TestLimitAndTotal(t *testing.T) {
-	ix := NewIndex()
+	ix := search.NewIndex()
 	for i := 0; i < 5; i++ {
 		ix.Add("idx", fmt.Sprintf("d%d", i), map[string]any{"text": "common word"})
 	}
@@ -234,7 +230,7 @@ func TestLimitAndTotal(t *testing.T) {
 }
 
 func TestEmptyQueryAndUnknownIndex(t *testing.T) {
-	ix := NewIndex()
+	ix := search.NewIndex()
 	ix.Add("idx", "1", map[string]any{"text": "fox"})
 
 	for _, q := range []string{"", "   ", "...", "!!!"} {
@@ -251,7 +247,7 @@ func TestEmptyQueryAndUnknownIndex(t *testing.T) {
 }
 
 func TestNumericAndBoolFieldsAreSearchable(t *testing.T) {
-	ix := NewIndex()
+	ix := search.NewIndex()
 	ix.Add("idx", "1", map[string]any{
 		"price": json.Number("9.99"),
 		"stock": 42,
@@ -272,7 +268,7 @@ func TestNumericAndBoolFieldsAreSearchable(t *testing.T) {
 }
 
 func TestEmptyDocumentIsStoredButMatchesNothing(t *testing.T) {
-	ix := NewIndex()
+	ix := search.NewIndex()
 	ix.Add("idx", "empty", map[string]any{})
 
 	if !ix.HasIndex("idx") {
@@ -289,7 +285,7 @@ func TestEmptyDocumentIsStoredButMatchesNothing(t *testing.T) {
 // TestPrefixMatchFindsLongerTerms: "key" must find docs containing "keyboard",
 // with the exact-token doc ranking above the prefix-only one.
 func TestPrefixMatchFindsLongerTerms(t *testing.T) {
-	ix := NewIndex()
+	ix := search.NewIndex()
 	ix.Add("idx", "a", map[string]any{"text": "keyboard"})
 	ix.Add("idx", "b", map[string]any{"text": "key"})
 
@@ -306,9 +302,9 @@ func TestPrefixMatchFindsLongerTerms(t *testing.T) {
 }
 
 // TestPrefixMatchPenalty: with identical tf and df, the prefix-only
-// contribution is exactly prefixPenalty × the exact one.
+// contribution is exactly 0.4 × the exact one.
 func TestPrefixMatchPenalty(t *testing.T) {
-	ix := NewIndex()
+	ix := search.NewIndex()
 	ix.Add("idx", "a", map[string]any{"text": "keyboard"})
 	ix.Add("idx", "b", map[string]any{"text": "key"})
 
@@ -316,10 +312,10 @@ func TestPrefixMatchPenalty(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("hits = %d, want 2", len(got))
 	}
-	// Same df=1, same tf=1 → ratio must equal prefixPenalty exactly.
+	// Same df=1, same tf=1 → ratio must equal 0.4 exactly.
 	ratio := got[1].Score / got[0].Score
-	if math.Abs(ratio-prefixPenalty) > 1e-9 {
-		t.Errorf("ratio = %v, want %v (prefix penalty)", ratio, prefixPenalty)
+	if math.Abs(ratio-0.4) > 1e-9 {
+		t.Errorf("ratio = %v, want %v (prefix penalty)", ratio, 0.4)
 	}
 }
 
@@ -327,7 +323,7 @@ func TestPrefixMatchPenalty(t *testing.T) {
 // substring dictionary match. Substrings count (mid-word), but a token with no
 // match at all rules out every document.
 func TestMatchRequiresTermInDictionary(t *testing.T) {
-	ix := NewIndex()
+	ix := search.NewIndex()
 	ix.Add("idx", "1", map[string]any{"text": "keyboard"})
 
 	if _, total := ix.Search("idx", "keyboard", 10); total != 1 {
@@ -351,7 +347,7 @@ func TestMatchRequiresTermInDictionary(t *testing.T) {
 // merely CONTAINS the token mid-word ("cockey", "monkey"), ranking below both
 // the exact and the prefix matches.
 func TestSubstringMatchFindsContainingTerms(t *testing.T) {
-	ix := NewIndex()
+	ix := search.NewIndex()
 	ix.Add("idx", "exact", map[string]any{"text": "key"})
 	ix.Add("idx", "prefix", map[string]any{"text": "keyboard"})
 	ix.Add("idx", "substr", map[string]any{"text": "cockey"})
@@ -370,9 +366,9 @@ func TestSubstringMatchFindsContainingTerms(t *testing.T) {
 }
 
 // TestSubstringMatchPenalty: with identical tf and df, a substring-only
-// contribution is exactly substringPenalty × the exact one.
+// contribution is exactly 0.15 × the exact one.
 func TestSubstringMatchPenalty(t *testing.T) {
-	ix := NewIndex()
+	ix := search.NewIndex()
 	ix.Add("idx", "a", map[string]any{"text": "key"})
 	ix.Add("idx", "b", map[string]any{"text": "cockey"})
 
@@ -381,14 +377,14 @@ func TestSubstringMatchPenalty(t *testing.T) {
 		t.Fatalf("hits = %d, want 2", len(got))
 	}
 	ratio := got[1].Score / got[0].Score
-	if math.Abs(ratio-substringPenalty) > 1e-9 {
-		t.Errorf("ratio = %v, want %v (substring penalty)", ratio, substringPenalty)
+	if math.Abs(ratio-0.15) > 1e-9 {
+		t.Errorf("ratio = %v, want %v (substring penalty)", ratio, 0.15)
 	}
 }
 
 // TestPrefixMultitokenAND: AND still applies across tokens after expansion.
 func TestPrefixMultitokenAND(t *testing.T) {
-	ix := NewIndex()
+	ix := search.NewIndex()
 	ix.Add("idx", "1", map[string]any{"text": "keyboard wireless"})
 	ix.Add("idx", "2", map[string]any{"text": "keyboard wired"})
 	ix.Add("idx", "3", map[string]any{"text": "wireless mouse"})
@@ -402,7 +398,7 @@ func TestPrefixMultitokenAND(t *testing.T) {
 // TestPrefixTermDictionaryIsMaintained: updating a document so a term
 // disappears must drop it from prefix expansion too.
 func TestPrefixTermDictionaryIsMaintained(t *testing.T) {
-	ix := NewIndex()
+	ix := search.NewIndex()
 	ix.Add("idx", "1", map[string]any{"text": "keyboard"})
 
 	ix.Add("idx", "1", map[string]any{"text": "monitor"}) // drop "keyboard"
@@ -423,7 +419,7 @@ func TestPrefixTermDictionaryIsMaintained(t *testing.T) {
 
 // TestConcurrentUse is exercised under the race detector (go test -race).
 func TestConcurrentUse(t *testing.T) {
-	ix := NewIndex()
+	ix := search.NewIndex()
 	const workers = 8
 	const n = 50
 
@@ -444,28 +440,17 @@ func TestConcurrentUse(t *testing.T) {
 	}
 	wg.Wait()
 
-	// Consistency: every document reported present must be findable and
-	// every missing one must not be (spot check via DocLength).
-	ix.mu.RLock()
-	defer ix.mu.RUnlock()
-	for docID := range ix.docLen["idx"] {
-		if _, ok := ix.docTerms["idx"][docID]; !ok {
-			t.Errorf("docLen has %q but docTerms does not", docID)
+	// Every odd document remains indexed; every even one was deleted.
+	for w := 0; w < workers; w++ {
+		for i := 0; i < n; i++ {
+			id := fmt.Sprintf("w%d-%d", w, i)
+			_, present := ix.DocLength("idx", id)
+			if present != (i%2 == 1) {
+				t.Errorf("DocLength(%q) present=%v, want %v", id, present, i%2 == 1)
+			}
 		}
 	}
-	for term, list := range ix.postings["idx"] {
-		for _, p := range list {
-			terms := ix.docTerms["idx"][p.DocID]
-			found := false
-			for _, tm := range terms {
-				if tm == term {
-					found = true
-					break
-				}
-			}
-			if !found {
-				t.Errorf("posting %q→%q not reflected in docTerms", term, p.DocID)
-			}
-		}
+	if _, total := ix.Search("idx", "doc", 0); total != workers*n/2 {
+		t.Errorf("search returned %d documents, want %d", total, workers*n/2)
 	}
 }

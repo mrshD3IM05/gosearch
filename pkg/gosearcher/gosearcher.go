@@ -4,8 +4,9 @@
 //
 // It is the "talk to a real database" surface from the project README. The
 // actual search always runs on the in-memory inverted index (pkg/search); the
-// database is read for the CURRENT row data on every call, so results reflect
-// live writes to the table.
+// database is checked for committed changes on every call. File-backed SQLite
+// tables reuse a cached snapshot while unchanged, and searches still reflect
+// committed writes on the next request.
 package gosearcher
 
 import (
@@ -14,13 +15,11 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
-
-	"gosearch/pkg/search"
+	"sync"
 )
 
 // Querier is the minimal database surface the engine needs. It is satisfied by
-// sqlQuerier (which adapts *sql.DB), and by the in-memory fake used in tests —
-// so tests never need a SQL driver.
+// sqlQuerier (which adapts *sql.DB), and by in-memory fakes in unit tests.
 type Querier interface {
 	QueryContext(ctx context.Context, query string, args ...any) (Rows, error)
 }
@@ -38,10 +37,14 @@ type Rows interface {
 // signatures to match exactly, and database/sql returns the concrete
 // *sql.Rows type, so a thin adapter is needed to surface it as Rows.
 type sqlQuerier struct {
-	db *sql.DB
+	db                 *sql.DB
+	monitorMu          sync.Mutex
+	monitorDB          *sql.DB
+	monitorConn        *sql.Conn
+	versionUnavailable bool
 }
 
-func (q sqlQuerier) QueryContext(ctx context.Context, query string, args ...any) (Rows, error) {
+func (q *sqlQuerier) QueryContext(ctx context.Context, query string, args ...any) (Rows, error) {
 	rows, err := q.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
@@ -52,7 +55,10 @@ func (q sqlQuerier) QueryContext(ctx context.Context, query string, args ...any)
 // GoSearcher holds the database reference. Create one with NewGoSearcher,
 // attach a database with LinkDB, then query tables with SearchTable.
 type GoSearcher struct {
-	db Querier
+	mu         sync.Mutex
+	db         Querier
+	cache      map[string]*tableSnapshot
+	cacheOrder []string
 }
 
 // NewGoSearcher returns a GoSearcher ready for LinkDB.
@@ -65,7 +71,7 @@ func NewGoSearcher() *GoSearcher {
 //
 //	gs := gosearcher.NewGoSearcher().LinkDB(db)
 func (g *GoSearcher) LinkDB(db *sql.DB) *GoSearcher {
-	return g.linkDB(sqlQuerier{db: db})
+	return g.linkDB(&sqlQuerier{db: db})
 }
 
 // LinkQuerier attaches any Querier. It exists for custom backends and tests
@@ -76,8 +82,28 @@ func (g *GoSearcher) LinkQuerier(db Querier) *GoSearcher {
 
 // linkDB attaches any Querier (used by tests and adapters).
 func (g *GoSearcher) linkDB(db Querier) *GoSearcher {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if old, ok := g.db.(*sqlQuerier); ok {
+		_ = old.closeMonitor()
+	}
 	g.db = db
+	g.cache = nil
+	g.cacheOrder = nil
 	return g
+}
+
+// Close releases the SQLite change-monitor connection opened by LinkDB.
+// It does not close the caller's *sql.DB.
+func (g *GoSearcher) Close() error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.cache = nil
+	g.cacheOrder = nil
+	if db, ok := g.db.(*sqlQuerier); ok {
+		return db.closeMonitor()
+	}
+	return nil
 }
 
 // ListTables returns the names of the database's tables and views. The query
@@ -113,8 +139,7 @@ func (g *GoSearcher) ListTables(ctx context.Context) ([]string, error) {
 type TableSearch struct {
 	// Query is analyzed with the same tokenizer used to index SearchCols.
 	Query string
-	// Table is the SQL table (or view) to search. Rows are read live from
-	// the database on every call.
+	// Table is the SQL table (or view) to search.
 	Table string
 	// SearchCols are the columns analyzed and matched; at least one is
 	// required. Anything outside this list never affects matching.
@@ -126,9 +151,9 @@ type TableSearch struct {
 	Limit int
 }
 
-// SearchTable answers ts.Query against one table: it reads the table's current
-// rows from the database, indexes only ts.SearchCols, runs the query over the
-// inverted index, and returns the live rows restricted to ts.ReturnCols.
+// SearchTable answers ts.Query against one table. For file-backed SQLite, it
+// reuses a snapshot until the database changes. Other Querier implementations
+// are read on every call unless they provide a stable change version.
 //
 // Result maps contain exactly the requested columns (ReturnCols, or all
 // columns when it is empty), ordered by descending score (ties broken by row
@@ -145,64 +170,26 @@ func (g *GoSearcher) SearchTable(ctx context.Context, ts TableSearch) ([]map[str
 		return nil, 0, errors.New("gosearcher: at least one search column required")
 	}
 
-	// The caller controls the table name, so this is a direct identifier
-	// (no escaping needed for well-formed names) — kept deliberately simple
-	// for an educational engine.
-	rows, err := g.db.QueryContext(ctx, "SELECT * FROM "+ts.Table)
+	snapshot, err := g.getSnapshot(ctx, ts)
 	if err != nil {
-		return nil, 0, fmt.Errorf("gosearcher: reading table %q: %w", ts.Table, err)
+		return nil, 0, err
 	}
-	defer rows.Close()
-
-	cols, err := rows.Columns()
-	if err != nil {
-		return nil, 0, fmt.Errorf("gosearcher: reading columns of %q: %w", ts.Table, err)
-	}
-	if missing := missingCols(cols, ts.SearchCols); len(missing) > 0 {
-		return nil, 0, fmt.Errorf("gosearcher: table %q has no search column(s) %v", ts.Table, missing)
-	}
-	if missing := missingCols(cols, ts.ReturnCols); len(missing) > 0 {
+	if missing := missingCols(snapshot.cols, ts.ReturnCols); len(missing) > 0 {
 		return nil, 0, fmt.Errorf("gosearcher: table %q has no return column(s) %v", ts.Table, missing)
 	}
 
 	returnCols := ts.ReturnCols
 	if len(returnCols) == 0 {
-		returnCols = cols
+		returnCols = snapshot.cols
 	}
-
-	// Snapshot the table once per call: index the search columns (keyed by
-	// row position) and keep the rows for the return step.
-	idx := search.NewIndex()
-	var snapshot [][]any
-	for rows.Next() {
-		row := make([]any, len(cols))
-		dests := make([]any, len(cols))
-		for i := range dests {
-			dests[i] = &row[i]
-		}
-		if err := rows.Scan(dests...); err != nil {
-			return nil, 0, fmt.Errorf("gosearcher: scanning %q: %w", ts.Table, err)
-		}
-
-		fields := map[string]any{}
-		for _, c := range ts.SearchCols {
-			fields[c] = row[colIndex(cols, c)]
-		}
-		idx.Add(ts.Table, strconv.Itoa(len(snapshot)), fields)
-		snapshot = append(snapshot, row)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, 0, fmt.Errorf("gosearcher: reading %q: %w", ts.Table, err)
-	}
-
-	hits, total := idx.Search(ts.Table, ts.Query, ts.Limit)
+	hits, total := snapshot.idx.Search(ts.Table, ts.Query, ts.Limit)
 	out := make([]map[string]any, 0, len(hits))
 	for _, h := range hits {
 		pos, err := strconv.Atoi(h.DocID)
 		if err != nil {
 			continue
 		}
-		out = append(out, project(snapshot[pos], cols, returnCols))
+		out = append(out, project(snapshot.rows[pos], snapshot.cols, returnCols))
 	}
 	return out, total, nil
 }

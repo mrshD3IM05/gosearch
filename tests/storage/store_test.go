@@ -1,14 +1,15 @@
-package storage
+package storage_test
 
 import (
-	"reflect"
 	"sync"
 	"testing"
+
+	"gosearch/pkg/storage"
 )
 
 func TestPutGetRoundTrip(t *testing.T) {
-	s := NewStore()
-	s.Put("products", "1", Document{Fields: map[string]any{
+	s := storage.NewStore()
+	s.Put("products", "1", storage.Document{Fields: map[string]any{
 		"name":  "widget",
 		"price": 9.99,
 	}})
@@ -31,9 +32,9 @@ func TestPutGetRoundTrip(t *testing.T) {
 }
 
 func TestPutOverwritesExistingDocument(t *testing.T) {
-	s := NewStore()
-	s.Put("products", "1", Document{Fields: map[string]any{"v": "old"}})
-	s.Put("products", "1", Document{Fields: map[string]any{"v": "new"}})
+	s := storage.NewStore()
+	s.Put("products", "1", storage.Document{Fields: map[string]any{"v": "old"}})
+	s.Put("products", "1", storage.Document{Fields: map[string]any{"v": "new"}})
 
 	doc, ok := s.Get("products", "1")
 	if !ok {
@@ -48,12 +49,12 @@ func TestPutOverwritesExistingDocument(t *testing.T) {
 }
 
 func TestGetMissingDocument(t *testing.T) {
-	s := NewStore()
+	s := storage.NewStore()
 
 	if _, ok := s.Get("products", "missing"); ok {
 		t.Error("expected miss from empty store")
 	}
-	s.Put("products", "1", Document{Fields: map[string]any{"a": 1}})
+	s.Put("products", "1", storage.Document{Fields: map[string]any{"a": 1}})
 	if _, ok := s.Get("other", "1"); ok {
 		t.Error("expected miss for unknown index")
 	}
@@ -63,8 +64,8 @@ func TestGetMissingDocument(t *testing.T) {
 }
 
 func TestDelete(t *testing.T) {
-	s := NewStore()
-	s.Put("products", "1", Document{Fields: map[string]any{"a": 1}})
+	s := storage.NewStore()
+	s.Put("products", "1", storage.Document{Fields: map[string]any{"a": 1}})
 
 	if !s.Delete("products", "1") {
 		t.Fatal("Delete of existing document reported false")
@@ -81,8 +82,8 @@ func TestDelete(t *testing.T) {
 }
 
 func TestDeleteRemovesEmptyIndex(t *testing.T) {
-	s := NewStore()
-	s.Put("products", "1", Document{Fields: map[string]any{"a": 1}})
+	s := storage.NewStore()
+	s.Put("products", "1", storage.Document{Fields: map[string]any{"a": 1}})
 	s.Delete("products", "1")
 
 	if got := s.Indices(); len(got) != 0 {
@@ -94,9 +95,9 @@ func TestDeleteRemovesEmptyIndex(t *testing.T) {
 }
 
 func TestIndicesAreIsolated(t *testing.T) {
-	s := NewStore()
-	s.Put("products", "1", Document{Fields: map[string]any{"who": "products"}})
-	s.Put("users", "1", Document{Fields: map[string]any{"who": "users"}})
+	s := storage.NewStore()
+	s.Put("products", "1", storage.Document{Fields: map[string]any{"who": "products"}})
+	s.Put("users", "1", storage.Document{Fields: map[string]any{"who": "users"}})
 
 	doc, _ := s.Get("products", "1")
 	if doc.Fields["who"] != "products" {
@@ -111,8 +112,8 @@ func TestIndicesAreIsolated(t *testing.T) {
 // TestGetReturnsCopy ensures callers cannot mutate the store through a
 // previously returned document.
 func TestGetReturnsCopy(t *testing.T) {
-	s := NewStore()
-	s.Put("products", "1", Document{Fields: map[string]any{"v": "original"}})
+	s := storage.NewStore()
+	s.Put("products", "1", storage.Document{Fields: map[string]any{"v": "original"}})
 
 	doc, _ := s.Get("products", "1")
 	doc.Fields["v"] = "mutated"
@@ -128,10 +129,10 @@ func TestGetReturnsCopy(t *testing.T) {
 }
 
 func TestListReturnsAllDocuments(t *testing.T) {
-	s := NewStore()
-	s.Put("products", "1", Document{Fields: map[string]any{"n": 1}})
-	s.Put("products", "2", Document{Fields: map[string]any{"n": 2}})
-	s.Put("users", "1", Document{Fields: map[string]any{"n": 9}})
+	s := storage.NewStore()
+	s.Put("products", "1", storage.Document{Fields: map[string]any{"n": 1}})
+	s.Put("products", "2", storage.Document{Fields: map[string]any{"n": 2}})
+	s.Put("users", "1", storage.Document{Fields: map[string]any{"n": 9}})
 
 	docs := s.List("products")
 	if len(docs) != 2 {
@@ -149,7 +150,7 @@ func TestListReturnsAllDocuments(t *testing.T) {
 // TestConcurrentAccess exercises the store under the race detector
 // (run with `go test -race`).
 func TestConcurrentAccess(t *testing.T) {
-	s := NewStore()
+	s := storage.NewStore()
 	const workers = 8
 	const n = 100
 
@@ -160,7 +161,7 @@ func TestConcurrentAccess(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < n; i++ {
 				id := string(rune('a'+w)) + string(rune('a'+i%26))
-				s.Put("idx", id, Document{Fields: map[string]any{"w": w, "i": i}})
+				s.Put("idx", id, storage.Document{Fields: map[string]any{"w": w, "i": i}})
 				s.Get("idx", id)
 				if i%3 == 0 {
 					s.Delete("idx", id)
@@ -178,13 +179,18 @@ func TestConcurrentAccess(t *testing.T) {
 	}
 }
 
-func TestCloneFieldsNil(t *testing.T) {
-	if got := cloneFields(nil); got != nil {
-		t.Errorf("cloneFields(nil) = %v, want nil", got)
+func TestPutCopiesFieldsAndPreservesNil(t *testing.T) {
+	s := storage.NewStore()
+	s.Put("idx", "nil", storage.Document{})
+	if got, ok := s.Get("idx", "nil"); !ok || got.Fields != nil {
+		t.Errorf("Get after nil fields = %v, %v; want nil fields", got, ok)
 	}
-	in := map[string]any{"a": 1}
-	out := cloneFields(in)
-	if !reflect.DeepEqual(in, out) {
-		t.Errorf("cloneFields(%v) = %v", in, out)
+
+	fields := map[string]any{"a": 1}
+	s.Put("idx", "copy", storage.Document{Fields: fields})
+	fields["a"] = 2
+	got, ok := s.Get("idx", "copy")
+	if !ok || got.Fields["a"] != 1 {
+		t.Errorf("Get after caller mutation = %v, %v; want a=1", got, ok)
 	}
 }

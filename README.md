@@ -14,7 +14,7 @@ Instead of wrapping Lucene, Bleve, or Elasticsearch, every component — tokeniz
 - **AND queries** — all query tokens must match; expansion happens per token
 - **Tiered scoring** — exact term matches outrank prefix matches (`key`→`keyboard`, ×0.4), which outrank substring matches (`key`→`cockey`, ×0.15)
 - **Standalone live-test console** — the frontend is a separate unit in `/web`, served on its own port, so you can edit and test against a running engine with no rebuild
-- **Database column-mode search** — `GoSearcher.LinkDB(db)` attaches a `*sql.DB`; `SearchTable` names a table, the **1+ columns to search by**, and the **1+ columns to return**, reading live rows
+- **Database column-mode search** — `GoSearcher.LinkDB(db)` attaches a `*sql.DB`; `SearchTable` names a table, the **1+ columns to search by**, and the **1+ columns to return**. File-backed SQLite tables reuse a cached index until the database changes.
 - **Sample corpus** — 1,011 course titles (including deliberate typo variants for fuzzy-search work) loadable in one click
 - **Concurrency-safe** — clean under `go test -race`
 
@@ -52,6 +52,7 @@ package layout
 ├── pkg/samples               1,011-title embedded search corpus
 ├── pkg/api                   REST handlers + CORS layer
 ├── pkg/gosearcher            GoSearcher: LinkDB + per-table column search
+├── tests/                    unit tests plus a temporary SQLite integration test
 └── web/                      standalone single-page console (no build step, no CDN)
 ```
 
@@ -166,13 +167,15 @@ Example response:
 Beyond pushed documents, `pkg/gosearcher` talks to a database directly. A
 `GoSearcher` holds a reference to a `*sql.DB` (via a small `Querier`
 interface), and `SearchTable` lets you name the table, the **1+ columns to
-search on**, and the **1+ columns to return**. Rows are read live from the
-database on every call, so results always reflect current data — no `PUT`
-export step.
+search on**, and the **1+ columns to return**. For file-backed SQLite, the
+first search builds an in-memory index. Later searches reuse it until a
+committed database write; the next search rebuilds it. No `PUT` export
+step is needed. Other database adapters still read rows on every call.
 
 ```go
-db, _ := sql.Open("sqlite3", "shop.db") // any *sql.DB / Querier
+db, _ := sql.Open("sqlite", "shop.db") // with modernc.org/sqlite imported
 gs := gosearcher.NewGoSearcher().LinkDB(db)
+defer gs.Close() // releases the change-monitor connection, not db
 
 results, total, err := gs.SearchTable(context.Background(), gosearcher.TableSearch{
     Table:      "products",
@@ -187,6 +190,7 @@ results, total, err := gs.SearchTable(context.Background(), gosearcher.TableSear
 - `ReturnCols` controls the result maps; empty means "every column".
 - Scoring is the same tiered TF-IDF as everywhere else (exact > prefix > substring).
 - `LinkDB` accepts a `*sql.DB` and adapts it internally, so any driver works; the tool below uses the bundled pure-Go SQLite driver.
+- SQLite caching uses a separate connection to detect committed changes, including writes by another process. In-memory databases and adapters without change detection keep the live-scan behavior.
 
 Try it against a real social-network database with the `sqlsearch` tool
 (`sn.db` at the repo root has posts, comments, messages, groups, and more):
@@ -227,6 +231,7 @@ make check         # format check + vet + race tests (matches CI)
 ```
 
 All checks run in CI on every push/PR (`.github/workflows/ci.yml`).
+Tests live under `tests/`; `go test ./...` runs both the unit tests and the real SQLite integration test.
 
 ## Roadmap
 
@@ -237,7 +242,8 @@ Implemented:
 - [x] AND search with exact, prefix and substring matching (tiered penalties)
 - [x] TF-IDF scoring
 - [x] Standalone live-test console (`/web`) + sample corpora
-- [x] Database-backed search: `GoSearcher.LinkDB(db)` + `SearchTable` with **1+ search columns** and **1+ return columns**, reading live rows (see "Searching a database table")
+- [x] Database-backed search: `GoSearcher.LinkDB(db)` + `SearchTable` with **1+ search columns** and **1+ return columns**, reflecting committed writes (see "Searching a database table")
+- [x] Reuse the table index for file-backed SQLite until a database change invalidates it
 - [x] Unselected columns never influence matching, and unrequested columns never leak into results
 
 Planned (educational order):
@@ -263,7 +269,7 @@ order:
 - [ ] Return a score column along with row data when requested (table results today carry exactly `ReturnCols`)
 - [ ] Auto-map schema into indices: table → index, row → document, column → field (today the column lists are explicit)
 - [ ] Respect primary keys so database updates overwrite rather than duplicate documents
-- [ ] Incremental live sync — poll or capture changes to re-index only what changed (today every `SearchTable` re-reads the whole table, which is correct but not incremental)
+- [ ] Incremental live sync — re-index only changed rows (today a SQLite change invalidates the cached table and triggers a full rebuild on the next search)
 
 ## License
 
